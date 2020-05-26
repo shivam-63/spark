@@ -16,7 +16,6 @@
  */
 
 package org.apache.spark.examples;
-
 import scala.Tuple2;
 
 import org.apache.spark.api.java.JavaPairRDD;
@@ -26,6 +25,9 @@ import org.apache.spark.sql.SparkSession;
 import java.util.Arrays;
 import java.util.List;
 import java.util.regex.Pattern;
+import org.apache.spark.palantir.shuffle.async.io.HadoopAsyncShuffleDataIo;
+
+
 
 public final class JavaWordCount {
   private static final Pattern SPACE = Pattern.compile(" ");
@@ -37,10 +39,17 @@ public final class JavaWordCount {
       System.exit(1);
     }
 
+//    SparkSession spark = SparkSession
+//      .builder()
+//      .appName("JavaWordCount")
+//      .getOrCreate();
     SparkSession spark = SparkSession
-      .builder()
-      .appName("JavaWordCount")
-      .getOrCreate();
+            .builder()
+            .appName("JavaWordCount")
+            .config("spark.hadoop.validateOutputSpecs", "false")
+            .config("spark.shuffle.sort.io.storage.plugin.class.v2",HadoopAsyncShuffleDataIo.class.getName())
+            .config("spark.shuffle.hadoop.async.base-uri","hdfs://localhost:9000/user/shivamsaini133/")
+            .getOrCreate();
 
     JavaRDD<String> lines = spark.read().textFile(args[0]).javaRDD();
 
