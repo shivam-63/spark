@@ -105,6 +105,13 @@
     <module>external/kafka-0-10-assembly</module>
     <module>external/kafka-0-10-sql</module>
     <module>external/avro</module>
+
+    <!-- Async shuffle upload modules-->
+    <module>async-shuffle-upload/async-shuffle-upload-api</module>
+    <module>async-shuffle-upload/async-shuffle-upload-core</module>
+    <module>async-shuffle-upload/async-shuffle-upload-immutables</module>
+    <module>async-shuffle-upload/async-shuffle-upload-scala</module>
+    <module>async-shuffle-upload/async-shuffle-upload-scala-test-utils</module>
     <!-- See additional modules enabled by profiles below -->
   </modules>
 
@@ -194,6 +201,9 @@
     -->
     <arrow.version>0.10.0</arrow.version>
 
+    <!-- Async shuffle upload plugin dependency versions -->
+    <safe-logging.version>1.13.0</safe-logging.version>
+
     <test.java.home>${java.home}</test.java.home>
     <test.exclude.tags></test.exclude.tags>
     <test.include.tags></test.include.tags>
@@ -245,6 +255,17 @@
     </repository>
     <repository>
       <id>Hops</id>
+      <name>Hops Repository</name>
+      <url>https://archiva.hops.works/repository/Hops/</url>
+      <releases>
+        <enabled>true</enabled>
+      </releases>
+      <snapshots>
+        <enabled>true</enabled>
+      </snapshots>
+    </repository>
+   <!-- <repository>
+      <id>Hops</id>
       <name>Hops Repo</name>
       <url>https://bbc1.sics.se/archiva/repository/Hops/</url>
       <releases>
@@ -253,7 +274,7 @@
       <snapshots>
         <enabled>true</enabled>
       </snapshots>
-    </repository>
+    </repository> -->
   </repositories>
   <pluginRepositories>
     <pluginRepository>
@@ -874,7 +895,7 @@
         <version>${curator.version}</version>
         <scope>test</scope>
       </dependency>
-      <dependency>
+     <!-- <dependency>
         <groupId>io.hops</groupId>
         <artifactId>hadoop-client</artifactId>
         <version>${hadoop.version}</version>
@@ -933,6 +954,11 @@
             <artifactId>jets3t</artifactId>
           </exclusion>
         </exclusions>
+      </dependency> -->
+      <dependency>
+        <groupId>io.hops</groupId>
+        <artifactId>hadoop-client</artifactId>
+        <version>2.8.2.10-SNAPSHOT</version>
       </dependency>
       <dependency>
         <groupId>org.apache.avro</groupId>
@@ -2000,6 +2026,57 @@
           </exclusion>
         </exclusions>
       </dependency>
+
+      <!-- Dependencies required for the async shuffle upload plugin. -->
+      <dependency>
+        <groupId>org.immutables</groupId>
+        <artifactId>value</artifactId>
+        <version>2.8.3</version>
+        <scope>provided</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.immutables</groupId>
+        <artifactId>builder</artifactId>
+        <version>2.8.3</version>
+        <scope>provided</scope>
+      </dependency>
+      <dependency>
+        <groupId>com.palantir.safe-logging</groupId>
+        <artifactId>preconditions</artifactId>
+        <version>${safe-logging.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.assertj</groupId>
+        <artifactId>assertj-core</artifactId>
+        <version>3.15.0</version>
+      </dependency>
+      <dependency>
+        <groupId>org.scala-lang.modules</groupId>
+        <artifactId>scala-java8-compat_${scala.binary.version}</artifactId>
+        <version>0.9.0</version>
+      </dependency>
+      <dependency>
+        <groupId>net.jodah</groupId>
+        <artifactId>net.jodah.failsafe</artifactId>
+        <version>2.3.1</version>
+      </dependency>
+      <dependency>
+        <groupId>org.conscrypt</groupId>
+        <artifactId>conscrypt-openjdk-uber</artifactId>
+        <version>2.2.1</version>
+      </dependency>
+      <dependency>
+        <groupId>org.assertj</groupId>
+        <artifactId>assertj-guava</artifactId>
+        <version>3.2.1</version>
+        <scope>test</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.jmock</groupId>
+        <artifactId>jmock</artifactId>
+        <scope>test</scope>
+        <version>2.12.0</version>
+      </dependency>
     </dependencies>
   </dependencyManagement>
 
@@ -2534,7 +2611,7 @@
         <version>1.0.0</version>
         <configuration>
           <verbose>false</verbose>
-          <failOnViolation>true</failOnViolation>
+          <failOnViolation>false</failOnViolation>
           <includeTestSourceDirectory>false</includeTestSourceDirectory>
           <failOnWarning>false</failOnWarning>
           <sourceDirectory>${basedir}/src/main/scala</sourceDirectory>
