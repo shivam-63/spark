@@ -22,6 +22,7 @@ import java.util.concurrent.TimeUnit
 import org.apache.spark.launcher.SparkLauncher
 import org.apache.spark.network.util.ByteUnit
 import org.apache.spark.scheduler.EventLoggingListener
+import org.apache.spark.shuffle.sort.io.LocalDiskShuffleDataIO
 import org.apache.spark.unsafe.array.ByteArrayMethods
 import org.apache.spark.util.Utils
 
@@ -569,6 +570,12 @@ package object config {
       .booleanConf
       .createWithDefault(false)
 
+  private[spark] val SHUFFLE_IO_PLUGIN_CLASS =
+    ConfigBuilder("spark.shuffle.sort.io.storage.plugin.class.v2")
+      .doc("Name of the class to use for shuffle IO.")
+      .stringConf
+      .createWithDefault(classOf[LocalDiskShuffleDataIO].getName)
+
   private[spark] val SHUFFLE_FILE_BUFFER_SIZE =
     ConfigBuilder("spark.shuffle.file.buffer")
       .doc("Size of the in-memory buffer for each shuffle file output stream, in KiB unless " +
@@ -761,6 +768,29 @@ package object config {
       .stringConf
       .toSequence
       .createWithDefault(Nil)
+
+  private[spark] val REDUCER_MAX_SIZE_IN_FLIGHT = ConfigBuilder("spark.reducer.maxSizeInFlight")
+    .doc("Maximum size of map outputs to fetch simultaneously from each reduce task, " +
+      "in MiB unless otherwise specified. Since each output requires us to create a " +
+      "buffer to receive it, this represents a fixed memory overhead per reduce task, " +
+      "so keep it small unless you have a large amount of memory")
+    .bytesConf(ByteUnit.MiB)
+    .createWithDefaultString("48m")
+
+  private[spark] val REDUCER_MAX_REQS_IN_FLIGHT = ConfigBuilder("spark.reducer.maxReqsInFlight")
+    .doc("This configuration limits the number of remote requests to fetch blocks at " +
+      "any given point. When the number of hosts in the cluster increase, " +
+      "it might lead to very large number of inbound connections to one or more nodes, " +
+      "causing the workers to fail under load. By allowing it to limit the number of " +
+      "fetch requests, this scenario can be mitigated")
+    .intConf
+    .createWithDefault(Int.MaxValue)
+
+  private[spark] val SHUFFLE_DETECT_CORRUPT =
+    ConfigBuilder("spark.shuffle.detectCorrupt")
+      .doc("Whether to detect any corruption in fetched blocks.")
+      .booleanConf
+      .createWithDefault(true)
 
   private[spark] val EXECUTOR_LOGS_ROLLING_STRATEGY =
     ConfigBuilder("spark.executor.logs.rolling.strategy").stringConf.createWithDefault("")
