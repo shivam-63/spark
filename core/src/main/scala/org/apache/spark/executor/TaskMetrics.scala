@@ -23,6 +23,7 @@ import scala.collection.mutable.{ArrayBuffer, LinkedHashMap}
 import org.apache.spark._
 import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.config.Tests.IS_TESTING
 import org.apache.spark.scheduler.AccumulableInfo
 import org.apache.spark.storage.{BlockId, BlockStatus}
 import org.apache.spark.util._
@@ -55,6 +56,8 @@ class TaskMetrics private[spark] () extends Serializable {
   private val _diskBytesSpilled = new LongAccumulator
   private val _peakExecutionMemory = new LongAccumulator
   private val _updatedBlockStatuses = new CollectionAccumulator[(BlockId, BlockStatus)]
+  private var _decorFunc: TempShuffleReadMetrics => TempShuffleReadMetrics =
+    Predef.identity[TempShuffleReadMetrics]
 
   /**
    * Time taken on the executor to deserialize this task.
@@ -186,9 +189,15 @@ class TaskMetrics private[spark] () extends Serializable {
    * be lost.
    */
   private[spark] def createTempShuffleReadMetrics(): TempShuffleReadMetrics = synchronized {
-    val readMetrics = new TempShuffleReadMetrics
-    tempShuffleReadMetrics += readMetrics
+    val tempShuffleMetrics = new TempShuffleReadMetrics
+    val readMetrics = _decorFunc(tempShuffleMetrics)
+    tempShuffleReadMetrics += tempShuffleMetrics
     readMetrics
+  }
+
+  private[spark] def decorateTempShuffleReadMetrics(
+      decorFunc: TempShuffleReadMetrics => TempShuffleReadMetrics): Unit = synchronized {
+    _decorFunc = decorFunc
   }
 
   /**
@@ -202,7 +211,7 @@ class TaskMetrics private[spark] () extends Serializable {
   }
 
   // Only used for test
-  private[spark] val testAccum = sys.props.get("spark.testing").map(_ => new LongAccumulator)
+  private[spark] val testAccum = sys.props.get(IS_TESTING.key).map(_ => new LongAccumulator)
 
 
   import InternalAccumulator._
