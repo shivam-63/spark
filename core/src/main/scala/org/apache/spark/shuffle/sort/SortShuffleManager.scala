@@ -19,9 +19,13 @@ package org.apache.spark.shuffle.sort
 
 import java.util.concurrent.ConcurrentHashMap
 
+import scala.collection.JavaConverters._
+import scala.sys.process._
+
 import org.apache.spark._
 import org.apache.spark.internal.Logging
 import org.apache.spark.shuffle._
+import org.apache.spark.shuffle.api.{ShuffleDataIO, ShuffleExecutorComponents}
 
 /**
  * In sort-based shuffle, incoming records are sorted according to their target partition ids, then
@@ -33,10 +37,10 @@ import org.apache.spark.shuffle._
  * Sort-based shuffle has two different write paths for producing its map output files:
  *
  *  - Serialized sorting: used when all three of the following conditions hold:
- *    1. The shuffle dependency specifies no aggregation or output ordering.
+ *    1. The shuffle dependency specifies no map-side combine.
  *    2. The shuffle serializer supports relocation of serialized values (this is currently
  *       supported by KryoSerializer and Spark SQL's custom serializers).
- *    3. The shuffle produces fewer than 16777216 output partitions.
+ *    3. The shuffle produces fewer than or equal to 16777216 output partitions.
  *  - Deserialized sorting: used to handle all other cases.
  *
  * -----------------------
@@ -68,6 +72,8 @@ import org.apache.spark.shuffle._
  */
 private[spark] class SortShuffleManager(conf: SparkConf) extends ShuffleManager with Logging {
 
+  import SortShuffleManager._
+
   if (!conf.getBoolean("spark.shuffle.spill", true)) {
     logWarning(
       "spark.shuffle.spill was set to false, but this configuration is ignored as of Spark 1.6+." +
@@ -78,6 +84,8 @@ private[spark] class SortShuffleManager(conf: SparkConf) extends ShuffleManager 
    * A mapping from shuffle ids to the number of mappers producing output for those shuffles.
    */
   private[this] val numMapsForShuffle = new ConcurrentHashMap[Int, Int]()
+
+  private lazy val shuffleExecutorComponents = loadShuffleExecutorComponents(conf)
 
   override val shuffleBlockResolver = new IndexShuffleBlockResolver(conf)
 
@@ -110,20 +118,42 @@ private[spark] class SortShuffleManager(conf: SparkConf) extends ShuffleManager 
    * Get a reader for a range of reduce partitions (startPartition to endPartition-1, inclusive).
    * Called on executors by reduce tasks.
    */
+
+  /**
+   * set flag so that script runs only for the first time on each executor
+    */
+
+  var flag = true
   override def getReader[K, C](
       handle: ShuffleHandle,
       startPartition: Int,
       endPartition: Int,
       context: TaskContext): ShuffleReader[K, C] = {
-    new BlockStoreShuffleReader(
-      handle.asInstanceOf[BaseShuffleHandle[K, _, C]], startPartition, endPartition, context)
+
+    /**
+     * call of script for killing the executors
+     */
+
+    if (flag) {
+      var result = "/bin/sh -c /opt/spark/data/script.sh".lineStream
+      flag = false
+    }
+
+    val blockStoreShuffleReader = new BlockStoreShuffleReader(
+      handle.asInstanceOf[BaseShuffleHandle[K, _, C]],
+      startPartition,
+      endPartition,
+      context,
+      shuffleExecutorComponents)
+    blockStoreShuffleReader
   }
 
   /** Get a writer for a given partition. Called on executors by map tasks. */
   override def getWriter[K, V](
       handle: ShuffleHandle,
       mapId: Int,
-      context: TaskContext): ShuffleWriter[K, V] = {
+      context: TaskContext,
+      metrics: ShuffleWriteMetricsReporter): ShuffleWriter[K, V] = {
     numMapsForShuffle.putIfAbsent(
       handle.shuffleId, handle.asInstanceOf[BaseShuffleHandle[_, _, _]].numMaps)
     val env = SparkEnv.get
@@ -131,22 +161,25 @@ private[spark] class SortShuffleManager(conf: SparkConf) extends ShuffleManager 
       case unsafeShuffleHandle: SerializedShuffleHandle[K @unchecked, V @unchecked] =>
         new UnsafeShuffleWriter(
           env.blockManager,
-          shuffleBlockResolver.asInstanceOf[IndexShuffleBlockResolver],
           context.taskMemoryManager(),
           unsafeShuffleHandle,
           mapId,
           context,
-          env.conf)
+          env.conf,
+          metrics,
+          shuffleExecutorComponents)
       case bypassMergeSortHandle: BypassMergeSortShuffleHandle[K @unchecked, V @unchecked] =>
         new BypassMergeSortShuffleWriter(
           env.blockManager,
-          shuffleBlockResolver.asInstanceOf[IndexShuffleBlockResolver],
           bypassMergeSortHandle,
           mapId,
-          context,
-          env.conf)
+          context.taskAttemptId(),
+          env.conf,
+          metrics,
+          shuffleExecutorComponents)
       case other: BaseShuffleHandle[K @unchecked, V @unchecked, _] =>
-        new SortShuffleWriter(shuffleBlockResolver, other, mapId, context)
+        new SortShuffleWriter(
+          shuffleBlockResolver, other, mapId, context, shuffleExecutorComponents)
     }
   }
 
@@ -200,6 +233,18 @@ private[spark] object SortShuffleManager extends Logging {
       log.debug(s"Can use serialized shuffle for shuffle $shufId")
       true
     }
+  }
+
+  private def loadShuffleExecutorComponents(conf: SparkConf): ShuffleExecutorComponents = {
+    val extraConfigs = conf.getAllWithPrefix(ShuffleDataIO.SHUFFLE_SPARK_CONF_PREFIX)
+      .toMap
+    val env = SparkEnv.get
+    val executorComponents = env.shuffleDataIo.executor()
+    executorComponents.initializeExecutor(
+      conf.getAppId,
+      SparkEnv.get.executorId,
+      extraConfigs.asJava)
+    executorComponents
   }
 }
 
