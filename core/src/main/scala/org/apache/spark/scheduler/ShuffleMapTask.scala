@@ -92,7 +92,24 @@ private[spark] class ShuffleMapTask(
       threadMXBean.getCurrentThreadCpuTime - deserializeStartCpuTime
     } else 0L
 
-    dep.shuffleWriterProcessor.write(rdd, dep, partitionId, context, partition)
+    var writer: ShuffleWriter[Any, Any] = null
+    try {
+      val manager = SparkEnv.get.shuffleManager
+      writer = manager.getWriter[Any, Any](dep.shuffleHandle, partitionId, context)
+      writer.write(rdd.iterator(partition, context).asInstanceOf[Iterator[_ <: Product2[Any, Any]]])
+      writer.stop(success = true).get
+    } catch {
+      case e: Exception =>
+        try {
+          if (writer != null) {
+            writer.stop(success = false)
+          }
+        } catch {
+          case e: Exception =>
+            log.debug("Could not stop writer", e)
+        }
+        throw e
+    }
   }
 
   override def preferredLocations: Seq[TaskLocation] = preferredLocs

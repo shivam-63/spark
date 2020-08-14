@@ -27,8 +27,7 @@ import scala.collection.JavaConverters._
 
 import org.apache.spark._
 import org.apache.spark.internal.Logging
-import org.apache.spark.internal.config.{BUFFER_SIZE, EXECUTOR_CORES}
-import org.apache.spark.internal.config.Python._
+import org.apache.spark.internal.config.PYSPARK_EXECUTOR_MEMORY
 import org.apache.spark.security.SocketAuthHelper
 import org.apache.spark.util._
 
@@ -71,17 +70,17 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
   require(funcs.length == argOffsets.length, "argOffsets should have the same length as funcs")
 
   private val conf = SparkEnv.get.conf
-  private val bufferSize = conf.get(BUFFER_SIZE)
-  private val reuseWorker = conf.get(PYTHON_WORKER_REUSE)
+  private val bufferSize = conf.getInt("spark.buffer.size", 65536)
+  private val reuseWorker = conf.getBoolean("spark.python.worker.reuse", true)
   // each python worker gets an equal part of the allocation. the worker pool will grow to the
   // number of concurrent tasks, which is determined by the number of cores in this executor.
-  private val memoryMb = conf.get(PYSPARK_EXECUTOR_MEMORY).map(_ / conf.get(EXECUTOR_CORES))
+  private val memoryMb = conf.get(PYSPARK_EXECUTOR_MEMORY)
+      .map(_ / conf.getInt("spark.executor.cores", 1))
 
   // All the Python functions should have the same exec, version and envvars.
   protected val envVars = funcs.head.funcs.head.envVars
   protected val pythonExec = funcs.head.funcs.head.pythonExec
   protected val pythonVer = funcs.head.funcs.head.pythonVer
-  protected val condaInstructions = funcs.head.funcs.head.condaSetupInstructions
 
   // TODO: support accumulator in multiple UDF
   protected val accumulator = funcs.head.funcs.head.accumulator
@@ -106,8 +105,7 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
     if (memoryMb.isDefined) {
       envVars.put("PYSPARK_EXECUTOR_MEMORY_MB", memoryMb.get.toString)
     }
-    val worker: Socket = env.createPythonWorker(pythonExec, envVars.asScala.toMap,
-      condaInstructions)
+    val worker: Socket = env.createPythonWorker(pythonExec, envVars.asScala.toMap)
     // Whether is the worker released into idle pool or closed. When any codes try to release or
     // close a worker, they should use `releasedOrClosed.compareAndSet` to flip the state to make
     // sure there is only one winner that is going to release or close the worker.
@@ -468,7 +466,7 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
       // Check whether the worker is ready to be re-used.
       if (stream.readInt() == SpecialLengths.END_OF_STREAM) {
         if (reuseWorker && releasedOrClosed.compareAndSet(false, true)) {
-          env.releasePythonWorker(pythonExec, envVars.asScala.toMap, condaInstructions, worker)
+          env.releasePythonWorker(pythonExec, envVars.asScala.toMap, worker)
         }
       }
       eos = true
@@ -498,7 +496,7 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
     extends Thread(s"Worker Monitor for $pythonExec") {
 
     /** How long to wait before killing the python worker if a task cannot be interrupted. */
-    private val taskKillTimeout = env.conf.get(PYTHON_TASK_KILL_TIMEOUT)
+    private val taskKillTimeout = env.conf.getTimeAsMs("spark.python.task.killTimeout", "2s")
 
     setDaemon(true)
 
@@ -516,7 +514,7 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
             val taskName = s"${context.partitionId}.${context.taskAttemptId} " +
               s"in stage ${context.stageId} (TID ${context.taskAttemptId})"
             logWarning(s"Incomplete task $taskName interrupted: Attempting to kill Python Worker")
-            env.destroyPythonWorker(pythonExec, envVars.asScala.toMap, condaInstructions, worker)
+            env.destroyPythonWorker(pythonExec, envVars.asScala.toMap, worker)
           } catch {
             case e: Exception =>
               logError("Exception when trying to kill worker", e)

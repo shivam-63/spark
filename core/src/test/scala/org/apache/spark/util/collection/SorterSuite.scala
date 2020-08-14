@@ -17,7 +17,7 @@
 
 package org.apache.spark.util.collection
 
-import java.lang.{Float => JFloat}
+import java.lang.{Float => JFloat, Integer => JInteger}
 import java.util.{Arrays, Comparator}
 
 import org.apache.spark.SparkFunSuite
@@ -48,7 +48,7 @@ class SorterSuite extends SparkFunSuite with Logging {
     // alternate. Keys are random doubles, values are ordinals from 0 to length.
     val keys = Array.tabulate[Double](5000) { i => rand.nextDouble() }
     val keyValueArray = Array.tabulate[Number](10000) { i =>
-      if (i % 2 == 0) keys(i / 2) else Integer.valueOf(i / 2)
+      if (i % 2 == 0) keys(i / 2) else new Integer(i / 2)
     }
 
     // Map from generated keys to values, to verify correctness later
@@ -112,7 +112,7 @@ class SorterSuite extends SparkFunSuite with Logging {
     // Test our key-value pairs where each element is a Tuple2[Float, Integer].
 
     val kvTuples = Array.tabulate(numElements) { i =>
-      (JFloat.valueOf(rand.nextFloat()), Integer.valueOf(i))
+      (new JFloat(rand.nextFloat()), new JInteger(i))
     }
 
     val kvTupleArray = new Array[AnyRef](numElements)
@@ -167,23 +167,23 @@ class SorterSuite extends SparkFunSuite with Logging {
 
     val ints = Array.fill(numElements)(rand.nextInt())
     val intObjects = {
-      val data = new Array[Integer](numElements)
+      val data = new Array[JInteger](numElements)
       var i = 0
       while (i < numElements) {
-        data(i) = Integer.valueOf(ints(i))
+        data(i) = new JInteger(ints(i))
         i += 1
       }
       data
     }
 
-    val intObjectArray = new Array[Integer](numElements)
+    val intObjectArray = new Array[JInteger](numElements)
     val prepareIntObjectArray = () => {
       System.arraycopy(intObjects, 0, intObjectArray, 0, numElements)
     }
 
     runExperiment("Java Arrays.sort() on non-primitive int array")({
-      Arrays.sort(intObjectArray, new Comparator[Integer] {
-        override def compare(x: Integer, y: Integer): Int = x.compareTo(y)
+      Arrays.sort(intObjectArray, new Comparator[JInteger] {
+        override def compare(x: JInteger, y: JInteger): Int = x.compareTo(y)
       })
     }, prepareIntObjectArray)
 

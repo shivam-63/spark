@@ -35,15 +35,13 @@ import org.apache.hadoop.mapred.{InputFormat, JobConf, OutputFormat}
 import org.apache.hadoop.mapreduce.{InputFormat => NewInputFormat, OutputFormat => NewOutputFormat}
 
 import org.apache.spark._
-import org.apache.spark.api.conda.CondaEnvironment.CondaSetupInstructions
 import org.apache.spark.api.java.{JavaPairRDD, JavaRDD, JavaSparkContext}
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.input.PortableDataStream
 import org.apache.spark.internal.Logging
-import org.apache.spark.internal.config.BUFFER_SIZE
 import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.rdd.RDD
-import org.apache.spark.security.{SocketAuthHelper, SocketAuthServer, SocketFuncServer}
+import org.apache.spark.security.SocketAuthHelper
 import org.apache.spark.util._
 
 
@@ -79,8 +77,7 @@ private[spark] case class PythonFunction(
     command: Array[Byte],
     envVars: JMap[String, String],
     pythonIncludes: JList[String],
-    condaSetupInstructions: Option[CondaSetupInstructions],
-    pythonExec: Option[String],
+    pythonExec: String,
     pythonVer: String,
     broadcastVars: JList[Broadcast[PythonBroadcast]],
     accumulator: PythonAccumulatorV2)
@@ -143,9 +140,8 @@ private[spark] object PythonRDD extends Logging {
    * (effectively a collect()), but allows you to run on a certain subset of partitions,
    * or to enable local execution.
    *
-   * @return 3-tuple (as a Java array) with the port number of a local socket which serves the
-   *         data collected from this job, the secret for authentication, and a socket auth
-   *         server object that can be used to join the JVM serving thread in Python.
+   * @return 2-tuple (as a Java array) with the port number of a local socket which serves the
+   *         data collected from this job, and the secret for authentication.
    */
   def runJob(
       sc: SparkContext,
@@ -163,86 +159,43 @@ private[spark] object PythonRDD extends Logging {
   /**
    * A helper function to collect an RDD as an iterator, then serve it via socket.
    *
-   * @return 3-tuple (as a Java array) with the port number of a local socket which serves the
-   *         data collected from this job, the secret for authentication, and a socket auth
-   *         server object that can be used to join the JVM serving thread in Python.
+   * @return 2-tuple (as a Java array) with the port number of a local socket which serves the
+   *         data collected from this job, and the secret for authentication.
    */
   def collectAndServe[T](rdd: RDD[T]): Array[Any] = {
     serveIterator(rdd.collect().iterator, s"serve RDD ${rdd.id}")
   }
 
-  /**
-   * A helper function to create a local RDD iterator and serve it via socket. Partitions are
-   * are collected as separate jobs, by order of index. Partition data is first requested by a
-   * non-zero integer to start a collection job. The response is prefaced by an integer with 1
-   * meaning partition data will be served, 0 meaning the local iterator has been consumed,
-   * and -1 meaning an error occurred during collection. This function is used by
-   * pyspark.rdd._local_iterator_from_socket().
-   *
-   * @return 3-tuple (as a Java array) with the port number of a local socket which serves the
-   *         data collected from this job, the secret for authentication, and a socket auth
-   *         server object that can be used to join the JVM serving thread in Python.
-   */
   def toLocalIteratorAndServe[T](rdd: RDD[T]): Array[Any] = {
-    val handleFunc = (sock: Socket) => {
-      val out = new DataOutputStream(sock.getOutputStream)
-      val in = new DataInputStream(sock.getInputStream)
-      Utils.tryWithSafeFinallyAndFailureCallbacks(block = {
-        // Collects a partition on each iteration
-        val collectPartitionIter = rdd.partitions.indices.iterator.map { i =>
-          rdd.sparkContext.runJob(rdd, (iter: Iterator[Any]) => iter.toArray, Seq(i)).head
-        }
-
-        // Write data until iteration is complete, client stops iteration, or error occurs
-        var complete = false
-        while (!complete) {
-
-          // Read request for data, value of zero will stop iteration or non-zero to continue
-          if (in.readInt() == 0) {
-            complete = true
-          } else if (collectPartitionIter.hasNext) {
-
-            // Client requested more data, attempt to collect the next partition
-            val partitionArray = collectPartitionIter.next()
-
-            // Send response there is a partition to read
-            out.writeInt(1)
-
-            // Write the next object and signal end of data for this iteration
-            writeIteratorToStream(partitionArray.toIterator, out)
-            out.writeInt(SpecialLengths.END_OF_DATA_SECTION)
-            out.flush()
-          } else {
-            // Send response there are no more partitions to read and close
-            out.writeInt(0)
-            complete = true
-          }
-        }
-      })(catchBlock = {
-        // Send response that an error occurred, original exception is re-thrown
-        out.writeInt(-1)
-      }, finallyBlock = {
-        out.close()
-        in.close()
-      })
-    }
-
-    val server = new SocketFuncServer(authHelper, "serve toLocalIterator", handleFunc)
-    Array(server.port, server.secret, server)
+    serveIterator(rdd.toLocalIterator, s"serve toLocalIterator")
   }
 
-  def readRDDFromFile(
-      sc: JavaSparkContext,
-      filename: String,
-      parallelism: Int): JavaRDD[Array[Byte]] = {
-    JavaRDD.readRDDFromFile(sc, filename, parallelism)
+  def readRDDFromFile(sc: JavaSparkContext, filename: String, parallelism: Int):
+  JavaRDD[Array[Byte]] = {
+    readRDDFromInputStream(sc.sc, new FileInputStream(filename), parallelism)
   }
 
   def readRDDFromInputStream(
       sc: SparkContext,
       in: InputStream,
       parallelism: Int): JavaRDD[Array[Byte]] = {
-    JavaRDD.readRDDFromInputStream(sc, in, parallelism)
+    val din = new DataInputStream(in)
+    try {
+      val objs = new mutable.ArrayBuffer[Array[Byte]]
+      try {
+        while (true) {
+          val length = din.readInt()
+          val obj = new Array[Byte](length)
+          din.readFully(obj)
+          objs += obj
+        }
+      } catch {
+        case eof: EOFException => // No-op
+      }
+      JavaRDD.fromRDD(sc.parallelize(objs, parallelism))
+    } finally {
+      din.close()
+    }
   }
 
   def setupBroadcast(path: String): PythonBroadcast = {
@@ -452,9 +405,8 @@ private[spark] object PythonRDD extends Logging {
    *
    * The thread will terminate after all the data are sent or any exceptions happen.
    *
-   * @return 3-tuple (as a Java array) with the port number of a local socket which serves the
-   *         data collected from this job, the secret for authentication, and a socket auth
-   *         server object that can be used to join the JVM serving thread in Python.
+   * @return 2-tuple (as a Java array) with the port number of a local socket which serves the
+   *         data collected from this job, and the secret for authentication.
    */
   def serveIterator(items: Iterator[_], threadName: String): Array[Any] = {
     serveToStream(threadName) { out =>
@@ -474,14 +426,18 @@ private[spark] object PythonRDD extends Logging {
    *
    * The thread will terminate after the block of code is executed or any
    * exceptions happen.
-   *
-   * @return 3-tuple (as a Java array) with the port number of a local socket which serves the
-   *         data collected from this job, the secret for authentication, and a socket auth
-   *         server object that can be used to join the JVM serving thread in Python.
    */
   private[spark] def serveToStream(
       threadName: String)(writeFunc: OutputStream => Unit): Array[Any] = {
-    SocketAuthServer.serveToStream(threadName, authHelper)(writeFunc)
+    val (port, secret) = PythonServer.setupOneConnectionServer(authHelper, threadName) { s =>
+      val out = new BufferedOutputStream(s.getOutputStream())
+      Utils.tryWithSafeFinally {
+        writeFunc(out)
+      } {
+        out.close()
+      }
+    }
+    Array(port, secret)
   }
 
   private def getMergedConf(confAsMap: java.util.HashMap[String, String],
@@ -648,7 +604,7 @@ private[spark] class PythonAccumulatorV2(
 
   Utils.checkHost(serverHost)
 
-  val bufferSize = SparkEnv.get.conf.get(BUFFER_SIZE)
+  val bufferSize = SparkEnv.get.conf.getInt("spark.buffer.size", 65536)
 
   /**
    * We try to reuse a single Socket to transfer accumulator updates, as they are all added
@@ -660,8 +616,10 @@ private[spark] class PythonAccumulatorV2(
     if (socket == null || socket.isClosed) {
       socket = new Socket(serverHost, serverPort)
       logInfo(s"Connected to AccumulatorServer at host: $serverHost port: $serverPort")
-      // send the secret just for the initial authentication when opening a new connection
-      socket.getOutputStream.write(secretToken.getBytes(StandardCharsets.UTF_8))
+      if (secretToken != null) {
+        // send the secret just for the initial authentication when opening a new connection
+        socket.getOutputStream.write(secretToken.getBytes(StandardCharsets.UTF_8))
+      }
     }
     socket
   }
@@ -703,8 +661,8 @@ private[spark] class PythonAccumulatorV2(
 private[spark] class PythonBroadcast(@transient var path: String) extends Serializable
     with Logging {
 
-  private var encryptionServer: SocketAuthServer[Unit] = null
-  private var decryptionServer: SocketAuthServer[Unit] = null
+  private var encryptionServer: PythonServer[Unit] = null
+  private var decryptionServer: PythonServer[Unit] = null
 
   /**
    * Read data from disks, then copy it to `out`
@@ -749,7 +707,7 @@ private[spark] class PythonBroadcast(@transient var path: String) extends Serial
   }
 
   def setupEncryptionServer(): Array[Any] = {
-    encryptionServer = new SocketAuthServer[Unit]("broadcast-encrypt-server") {
+    encryptionServer = new PythonServer[Unit]("broadcast-encrypt-server") {
       override def handleConnection(sock: Socket): Unit = {
         val env = SparkEnv.get
         val in = sock.getInputStream()
@@ -762,7 +720,7 @@ private[spark] class PythonBroadcast(@transient var path: String) extends Serial
   }
 
   def setupDecryptionServer(): Array[Any] = {
-    decryptionServer = new SocketAuthServer[Unit]("broadcast-decrypt-server-for-driver") {
+    decryptionServer = new PythonServer[Unit]("broadcast-decrypt-server-for-driver") {
       override def handleConnection(sock: Socket): Unit = {
         val out = new DataOutputStream(new BufferedOutputStream(sock.getOutputStream()))
         Utils.tryWithSafeFinally {
@@ -858,12 +816,90 @@ private[spark] object DechunkedInputStream {
 }
 
 /**
+ * Creates a server in the jvm to communicate with python for handling one batch of data, with
+ * authentication and error handling.
+ */
+private[spark] abstract class PythonServer[T](
+    authHelper: SocketAuthHelper,
+    threadName: String) {
+
+  def this(env: SparkEnv, threadName: String) = this(new SocketAuthHelper(env.conf), threadName)
+  def this(threadName: String) = this(SparkEnv.get, threadName)
+
+  val (port, secret) = PythonServer.setupOneConnectionServer(authHelper, threadName) { sock =>
+    promise.complete(Try(handleConnection(sock)))
+  }
+
+  /**
+   * Handle a connection which has already been authenticated.  Any error from this function
+   * will clean up this connection and the entire server, and get propogated to [[getResult]].
+   */
+  def handleConnection(sock: Socket): T
+
+  val promise = Promise[T]()
+
+  /**
+   * Blocks indefinitely for [[handleConnection]] to finish, and returns that result.  If
+   * handleConnection throws an exception, this will throw an exception which includes the original
+   * exception as a cause.
+   */
+  def getResult(): T = {
+    getResult(Duration.Inf)
+  }
+
+  def getResult(wait: Duration): T = {
+    ThreadUtils.awaitResult(promise.future, wait)
+  }
+
+}
+
+private[spark] object PythonServer {
+
+  /**
+   * Create a socket server and run user function on the socket in a background thread.
+   *
+   * The socket server can only accept one connection, or close if no connection
+   * in 15 seconds.
+   *
+   * The thread will terminate after the supplied user function, or if there are any exceptions.
+   *
+   * If you need to get a result of the supplied function, create a subclass of [[PythonServer]]
+   *
+   * @return The port number of a local socket and the secret for authentication.
+   */
+  def setupOneConnectionServer(
+      authHelper: SocketAuthHelper,
+      threadName: String)
+      (func: Socket => Unit): (Int, String) = {
+    val serverSocket = new ServerSocket(0, 1, InetAddress.getByAddress(Array(127, 0, 0, 1)))
+    // Close the socket if no connection in 15 seconds
+    serverSocket.setSoTimeout(15000)
+
+    new Thread(threadName) {
+      setDaemon(true)
+      override def run(): Unit = {
+        var sock: Socket = null
+        try {
+          sock = serverSocket.accept()
+          authHelper.authClient(sock)
+          func(sock)
+        } finally {
+          JavaUtils.closeQuietly(serverSocket)
+          JavaUtils.closeQuietly(sock)
+        }
+      }
+    }.start()
+    (serverSocket.getLocalPort, authHelper.secret)
+  }
+}
+
+/**
  * Sends decrypted broadcast data to python worker.  See [[PythonRunner]] for entire protocol.
  */
 private[spark] class EncryptedPythonBroadcastServer(
     val env: SparkEnv,
     val idsAndFiles: Seq[(Long, String)])
-    extends SocketAuthServer[Unit]("broadcast-decrypt-server") with Logging {
+    extends PythonServer[Unit]("broadcast-decrypt-server") with Logging {
 
   override def handleConnection(socket: Socket): Unit = {
     val out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()))
@@ -901,7 +937,7 @@ private[spark] class EncryptedPythonBroadcastServer(
  * over a socket.  This is used in preference to writing data to a file when encryption is enabled.
  */
 private[spark] abstract class PythonRDDServer
-    extends SocketAuthServer[JavaRDD[Array[Byte]]]("pyspark-parallelize-server") {
+    extends PythonServer[JavaRDD[Array[Byte]]]("pyspark-parallelize-server") {
 
   def handleConnection(sock: Socket): JavaRDD[Array[Byte]] = {
     val in = sock.getInputStream()
@@ -920,3 +956,4 @@ private[spark] class PythonParallelizeServer(sc: SparkContext, parallelism: Int)
     PythonRDD.readRDDFromInputStream(sc, input, parallelism)
   }
 }
+

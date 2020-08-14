@@ -21,10 +21,8 @@ import java.io.Serializable
 
 import scala.reflect.ClassTag
 
-import com.palantir.logsafe.{SafeArg, UnsafeArg}
-
 import org.apache.spark.SparkException
-import org.apache.spark.internal.SafeLogging
+import org.apache.spark.internal.Logging
 import org.apache.spark.util.Utils
 
 /**
@@ -56,7 +54,7 @@ import org.apache.spark.util.Utils
  * @param id A unique identifier for the broadcast variable.
  * @tparam T Type of the data contained in the broadcast variable.
  */
-abstract class Broadcast[T: ClassTag](val id: Long) extends Serializable with SafeLogging {
+abstract class Broadcast[T: ClassTag](val id: Long) extends Serializable with Logging {
 
   /**
    * Flag signifying whether the broadcast variable is valid
@@ -109,10 +107,7 @@ abstract class Broadcast[T: ClassTag](val id: Long) extends Serializable with Sa
     assertValid()
     _isValid = false
     _destroySite = Utils.getCallSite().shortForm
-    safeLogInfo("Destroying",
-      SafeArg.of("id", id),
-      UnsafeArg.of("stringRepr", toString),
-      UnsafeArg.of("destroySite", _destroySite))
+    logInfo("Destroying %s (from %s)".format(toString, _destroySite))
     doDestroy(blocking)
   }
 

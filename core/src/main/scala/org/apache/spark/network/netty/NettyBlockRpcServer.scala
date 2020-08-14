@@ -45,8 +45,7 @@ class NettyBlockRpcServer(
     blockManager: BlockDataManager)
   extends RpcHandler with Logging {
 
-  private val
-  streamManager = new OneForOneStreamManager()
+  private val streamManager = new OneForOneStreamManager()
 
   override def receive(
       client: TransportClient,

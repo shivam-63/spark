@@ -25,13 +25,13 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReferenc
 
 import scala.collection.JavaConverters._
 import scala.collection.Map
+import scala.collection.generic.Growable
 import scala.collection.mutable.HashMap
 import scala.language.implicitConversions
 import scala.reflect.{classTag, ClassTag}
 import scala.util.control.NonFatal
 
 import com.google.common.collect.MapMaker
-import com.palantir.logsafe.{SafeArg, UnsafeArg}
 import org.apache.commons.lang3.SerializationUtils
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
@@ -41,49 +41,48 @@ import org.apache.hadoop.mapreduce.{InputFormat => NewInputFormat, Job => NewHad
 import org.apache.hadoop.mapreduce.lib.input.{FileInputFormat => NewFileInputFormat}
 
 import org.apache.spark.annotation.DeveloperApi
-import org.apache.spark.api.conda.CondaEnvironment
-import org.apache.spark.api.conda.CondaEnvironment.CondaSetupInstructions
 import org.apache.spark.broadcast.Broadcast
-import org.apache.spark.deploy.{CondaRunner, LocalSparkCluster, SparkHadoopUtil}
+import org.apache.spark.deploy.{LocalSparkCluster, SparkHadoopUtil}
 import org.apache.spark.input.{FixedLengthBinaryInputFormat, PortableDataStream, StreamInputFormat, WholeTextFileInputFormat}
-import org.apache.spark.internal.SafeLogging
+import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config._
-import org.apache.spark.internal.config.Tests._
-import org.apache.spark.internal.config.UI._
 import org.apache.spark.io.CompressionCodec
 import org.apache.spark.partial.{ApproximateEvaluator, PartialResult}
 import org.apache.spark.rdd._
 import org.apache.spark.rpc.RpcEndpointRef
 import org.apache.spark.scheduler._
-import org.apache.spark.scheduler.cluster.StandaloneSchedulerBackend
+import org.apache.spark.scheduler.cluster.{CoarseGrainedSchedulerBackend, StandaloneSchedulerBackend}
 import org.apache.spark.scheduler.local.LocalSchedulerBackend
-import org.apache.spark.shuffle.api.{ShuffleDataIO, ShuffleDriverComponents}
-import org.apache.spark.status.{AppStatusSource, AppStatusStore}
+import org.apache.spark.status.AppStatusStore
 import org.apache.spark.status.api.v1.ThreadStackTrace
 import org.apache.spark.storage._
 import org.apache.spark.storage.BlockManagerMessages.TriggerThreadDump
 import org.apache.spark.ui.{ConsoleProgressBar, SparkUI}
 import org.apache.spark.util._
-import org.apache.spark.util.logging.DriverLogger
 
 /**
  * Main entry point for Spark functionality. A SparkContext represents the connection to a Spark
  * cluster, and can be used to create RDDs, accumulators and broadcast variables on that cluster.
  *
- * @note Only one `SparkContext` should be active per JVM. You must `stop()` the
- *   active `SparkContext` before creating a new one.
+ * Only one SparkContext may be active per JVM.  You must `stop()` the active SparkContext before
+ * creating a new one.  This limitation may eventually be removed; see SPARK-2243 for more details.
+ *
  * @param config a Spark Config object describing the application configuration. Any settings in
  *   this config overrides the default configs as well as system properties.
  */
-class SparkContext(config: SparkConf) extends SafeLogging {
+class SparkContext(config: SparkConf) extends Logging {
 
   // The call site where this SparkContext was constructed.
   private val creationSite: CallSite = Utils.getCallSite()
 
+  // If true, log warnings instead of throwing exceptions when multiple SparkContexts are active
+  private val allowMultipleContexts: Boolean =
+    config.getBoolean("spark.driver.allowMultipleContexts", false)
+
   // In order to prevent multiple SparkContexts from being active at the same time, mark this
   // context as having started construction.
   // NOTE: this must be placed at the beginning of the SparkContext constructor.
-  SparkContext.markPartiallyConstructed(this)
+  SparkContext.markPartiallyConstructed(this, allowMultipleContexts)
 
   val startTime = System.currentTimeMillis()
 
@@ -181,7 +180,7 @@ class SparkContext(config: SparkConf) extends SafeLogging {
     this(master, appName, sparkHome, jars, Map())
 
   // log out Spark Version in Spark driver log
-  safeLogInfo("Running Spark version", SafeArg.of("SPARK_VERSION", SPARK_VERSION))
+  logInfo(s"Running Spark version $SPARK_VERSION")
 
   /* ------------------------------------------------------------------------------------- *
    | Private variables. These variables keep the internal state of the context, and are    |
@@ -207,7 +206,6 @@ class SparkContext(config: SparkConf) extends SafeLogging {
   private var _applicationId: String = _
   private var _applicationAttemptId: Option[String] = None
   private var _eventLogger: Option[EventLoggingListener] = None
-  private var _driverLogger: Option[DriverLogger] = None
   private var _executorAllocationManager: Option[ExecutorAllocationManager] = None
   private var _cleaner: Option[ContextCleaner] = None
   private var _listenerBusStarted: Boolean = false
@@ -215,8 +213,6 @@ class SparkContext(config: SparkConf) extends SafeLogging {
   private var _files: Seq[String] = _
   private var _shutdownHookRef: AnyRef = _
   private var _statusStore: AppStatusStore = _
-  private var _heartbeater: Heartbeater = _
-  private var _shuffleDriverComponents: ShuffleDriverComponents = _
 
   /* ------------------------------------------------------------------------------------- *
    | Accessors and public fields. These provide access to the internal state of the        |
@@ -234,10 +230,10 @@ class SparkContext(config: SparkConf) extends SafeLogging {
   def jars: Seq[String] = _jars
   def files: Seq[String] = _files
   def master: String = _conf.get("spark.master")
-  def deployMode: String = _conf.get(SUBMIT_DEPLOY_MODE)
+  def deployMode: String = _conf.getOption("spark.submit.deployMode").getOrElse("client")
   def appName: String = _conf.get("spark.app.name")
 
-  private[spark] def isEventLogEnabled: Boolean = _conf.get(EVENT_LOG_ENABLED)
+  private[spark] def isEventLogEnabled: Boolean = _conf.getBoolean("spark.eventLog.enabled", false)
   private[spark] def eventLogDir: Option[URI] = _eventLogDir
   private[spark] def eventLogCodec: Option[String] = _eventLogCodec
 
@@ -308,8 +304,6 @@ class SparkContext(config: SparkConf) extends SafeLogging {
     _dagScheduler = ds
   }
 
-  private[spark] def shuffleDriverComponents: ShuffleDriverComponents = _shuffleDriverComponents
-
   /**
    * A unique identifier for the Spark application.
    * Its format depends on the scheduler implementation.
@@ -341,9 +335,6 @@ class SparkContext(config: SparkConf) extends SafeLogging {
     override protected def initialValue(): Properties = new Properties()
   }
 
-  // Retrieve the Conda Environment from CondaRunner if it has set one up for us
-  def condaEnvironment(): Option[CondaEnvironment] = CondaRunner.condaEnvironment.get()
-
   /* ------------------------------------------------------------------------------------- *
    | Initialization. This code initializes the context in a manner that is exception-safe. |
    | All internal fields holding state are initialized here, and any error prompts the     |
@@ -351,7 +342,7 @@ class SparkContext(config: SparkConf) extends SafeLogging {
    * ------------------------------------------------------------------------------------- */
 
   private def warnSparkMem(value: String): String = {
-    safeLogWarning("Using SPARK_MEM to set amount of memory to use per executor process is " +
+    logWarning("Using SPARK_MEM to set amount of memory to use per executor process is " +
       "deprecated, please use spark.executor.memory instead.")
     value
   }
@@ -380,10 +371,8 @@ class SparkContext(config: SparkConf) extends SafeLogging {
       throw new SparkException("An application name must be set in your configuration")
     }
 
-    _driverLogger = DriverLogger(_conf)
-
     // log out spark.app.name in the Spark driver logs
-    safeLogInfo("Submitted application", SafeArg.of("appName", appName))
+    logInfo(s"Submitted application: $appName")
 
     // System property spark.yarn.app.id must be set if user code ran by AM on a YARN cluster
     if (master == "yarn" && deployMode == "cluster" && !_conf.contains("spark.yarn.app.id")) {
@@ -392,15 +381,15 @@ class SparkContext(config: SparkConf) extends SafeLogging {
     }
 
     if (_conf.getBoolean("spark.logConf", false)) {
-      safeLogInfo("Spark configuration", UnsafeArg.of("conf", _conf.toDebugString))
+      logInfo("Spark configuration:\n" + _conf.toDebugString)
     }
 
     // Set Spark driver host and port system properties. This explicitly sets the configuration
     // instead of relying on the default value of the config constant.
     _conf.set(DRIVER_HOST_ADDRESS, _conf.get(DRIVER_HOST_ADDRESS))
-    _conf.setIfMissing(DRIVER_PORT, 0)
+    _conf.setIfMissing("spark.driver.port", "0")
 
-    _conf.set(EXECUTOR_ID, SparkContext.DRIVER_IDENTIFIER)
+    _conf.set("spark.executor.id", SparkContext.DRIVER_IDENTIFIER)
 
     _jars = Utils.getUserJars(_conf)
     _files = _conf.getOption("spark.files").map(_.split(",")).map(_.filter(_.nonEmpty))
@@ -408,14 +397,15 @@ class SparkContext(config: SparkConf) extends SafeLogging {
 
     _eventLogDir =
       if (isEventLogEnabled) {
-        val unresolvedDir = conf.get(EVENT_LOG_DIR).stripSuffix("/")
+        val unresolvedDir = conf.get("spark.eventLog.dir", EventLoggingListener.DEFAULT_LOG_DIR)
+          .stripSuffix("/")
         Some(Utils.resolveURI(unresolvedDir))
       } else {
         None
       }
 
     _eventLogCodec = {
-      val compress = _conf.get(EVENT_LOG_COMPRESS)
+      val compress = _conf.getBoolean("spark.eventLog.compress", false)
       if (compress && isEventLogEnabled) {
         Some(CompressionCodec.getCodecName(_conf)).map(CompressionCodec.getShortName)
       } else {
@@ -427,8 +417,7 @@ class SparkContext(config: SparkConf) extends SafeLogging {
 
     // Initialize the app status store and listener before SparkEnv is created so that it gets
     // all events.
-    val appStatusSource = AppStatusSource.createSource(conf)
-    _statusStore = AppStatusStore.createLiveStore(conf, appStatusSource)
+    _statusStore = AppStatusStore.createLiveStore(conf)
     listenerBus.addToStatusQueue(_statusStore.listener.get)
 
     // Create the Spark execution environment (cache, map output tracker, etc)
@@ -444,14 +433,14 @@ class SparkContext(config: SparkConf) extends SafeLogging {
     _statusTracker = new SparkStatusTracker(this, _statusStore)
 
     _progressBar =
-      if (_conf.get(UI_SHOW_CONSOLE_PROGRESS) && !safeLogIsInfoEnabled) {
+      if (_conf.get(UI_SHOW_CONSOLE_PROGRESS) && !log.isInfoEnabled) {
         Some(new ConsoleProgressBar(this))
       } else {
         None
       }
 
     _ui =
-      if (conf.get(UI_ENABLED)) {
+      if (conf.getBoolean("spark.ui.enabled", true)) {
         Some(SparkUI.create(Some(this), _statusStore, _conf, _env.securityManager, appName, "",
           startTime))
       } else {
@@ -473,7 +462,7 @@ class SparkContext(config: SparkConf) extends SafeLogging {
       files.foreach(addFile)
     }
 
-    _executorMemory = _conf.getOption(EXECUTOR_MEMORY.key)
+    _executorMemory = _conf.getOption("spark.executor.memory")
       .orElse(Option(System.getenv("SPARK_EXECUTOR_MEMORY")))
       .orElse(Option(System.getenv("SPARK_MEM"))
       .map(warnSparkMem))
@@ -482,7 +471,7 @@ class SparkContext(config: SparkConf) extends SafeLogging {
 
     // Convert java options to env vars as a work around
     // since we can't set env vars directly in sbt.
-    for { (envKey, propKey) <- Seq(("SPARK_TESTING", IS_TESTING.key))
+    for { (envKey, propKey) <- Seq(("SPARK_TESTING", "spark.testing"))
       value <- Option(System.getenv(envKey)).orElse(Option(System.getProperty(propKey)))} {
       executorEnvs(envKey) = value
     }
@@ -494,10 +483,6 @@ class SparkContext(config: SparkConf) extends SafeLogging {
     executorEnvs("SPARK_EXECUTOR_MEMORY") = executorMemory + "m"
     executorEnvs ++= _conf.getExecutorEnv
     executorEnvs("SPARK_USER") = sparkUser
-
-    _shuffleDriverComponents = _env.shuffleDataIo.driver()
-    _shuffleDriverComponents.initializeApplication().asScala.foreach {
-      case (k, v) => _conf.set(ShuffleDataIO.SHUFFLE_SPARK_CONF_PREFIX + k, v) }
 
     // We need to register "HeartbeatReceiver" before "createTaskScheduler" because Executor will
     // retrieve "HeartbeatReceiver" in the constructor. (SPARK-6640)
@@ -511,13 +496,6 @@ class SparkContext(config: SparkConf) extends SafeLogging {
     _dagScheduler = new DAGScheduler(this)
     _heartbeatReceiver.ask[Boolean](TaskSchedulerIsSet)
 
-    // create and start the heartbeater for collecting memory metrics
-    _heartbeater = new Heartbeater(env.memoryManager,
-      () => SparkContext.this.reportHeartBeat(),
-      "driver-heartbeater",
-      conf.get(EXECUTOR_HEARTBEAT_INTERVAL))
-    _heartbeater.start()
-
     // start TaskScheduler after taskScheduler sets DAGScheduler reference in DAGScheduler's
     // constructor
     _taskScheduler.start()
@@ -525,7 +503,7 @@ class SparkContext(config: SparkConf) extends SafeLogging {
     _applicationId = _taskScheduler.applicationId()
     _applicationAttemptId = taskScheduler.applicationAttemptId()
     _conf.set("spark.app.id", _applicationId)
-    if (_conf.get(UI_REVERSE_PROXY)) {
+    if (_conf.getBoolean("spark.ui.reverseProxy", false)) {
       System.setProperty("spark.ui.proxyBase", "/proxy/" + _applicationId)
     }
     _ui.foreach(_.setAppId(_applicationId))
@@ -557,7 +535,6 @@ class SparkContext(config: SparkConf) extends SafeLogging {
           case b: ExecutorAllocationClient =>
             Some(new ExecutorAllocationManager(
               schedulerBackend.asInstanceOf[ExecutorAllocationClient], listenerBus, _conf,
-              _env.mapOutputTracker.asInstanceOf[MapOutputTrackerMaster],
               _env.blockManager.master))
           case _ =>
             None
@@ -568,8 +545,8 @@ class SparkContext(config: SparkConf) extends SafeLogging {
     _executorAllocationManager.foreach(_.start())
 
     _cleaner =
-      if (_conf.get(CLEANER_REFERENCE_TRACKING)) {
-        Some(new ContextCleaner(this, _shuffleDriverComponents))
+      if (_conf.getBoolean("spark.cleaner.referenceTracking", true)) {
+        Some(new ContextCleaner(this))
       } else {
         None
       }
@@ -586,29 +563,29 @@ class SparkContext(config: SparkConf) extends SafeLogging {
     _executorAllocationManager.foreach { e =>
       _env.metricsSystem.registerSource(e.executorAllocationManagerSource)
     }
-    appStatusSource.foreach(_env.metricsSystem.registerSource(_))
+
     // Make sure the context is stopped if the user forgets about it. This avoids leaving
     // unfinished event logs around after the JVM exits cleanly. It doesn't help if the JVM
     // is killed, though.
-    safeLogDebug("Adding shutdown hook") // force eager creation of logger
+    logDebug("Adding shutdown hook") // force eager creation of logger
     _shutdownHookRef = ShutdownHookManager.addShutdownHook(
       ShutdownHookManager.SPARK_CONTEXT_SHUTDOWN_PRIORITY) { () =>
-      safeLogInfo("Invoking stop() from shutdown hook")
+      logInfo("Invoking stop() from shutdown hook")
       try {
         stop()
       } catch {
         case e: Throwable =>
-          safeLogWarning("Ignoring Exception while stopping SparkContext from shutdown hook", e)
+          logWarning("Ignoring Exception while stopping SparkContext from shutdown hook", e)
       }
     }
   } catch {
     case NonFatal(e) =>
-      safeLogError("Error initializing SparkContext.", e)
+      logError("Error initializing SparkContext.", e)
       try {
         stop()
       } catch {
         case NonFatal(inner) =>
-          safeLogError("Error stopping SparkContext after init error.", inner)
+          logError("Error stopping SparkContext after init error.", inner)
       } finally {
         throw e
       }
@@ -630,9 +607,7 @@ class SparkContext(config: SparkConf) extends SafeLogging {
       }
     } catch {
       case e: Exception =>
-        safeLogError("Exception getting thread dump from executor",
-          e,
-          SafeArg.of("executorId", executorId))
+        logError(s"Exception getting thread dump from executor $executorId", e)
         None
     }
   }
@@ -1056,7 +1031,7 @@ class SparkContext(config: SparkConf) extends SafeLogging {
     // See SPARK-11227 for details.
     FileSystem.getLocal(hadoopConfiguration)
 
-    // A Hadoop configuration can be about 10 KiB, which is pretty big, so broadcast it.
+    // A Hadoop configuration can be about 10 KB, which is pretty big, so broadcast it.
     val confBroadcast = broadcast(new SerializableConfiguration(hadoopConfiguration))
     val setInputPathsFunc = (jobConf: JobConf) => FileInputFormat.setInputPaths(jobConf, path)
     new HadoopRDD(
@@ -1356,6 +1331,76 @@ class SparkContext(config: SparkConf) extends SafeLogging {
   // Methods for creating shared variables
 
   /**
+   * Create an [[org.apache.spark.Accumulator]] variable of a given type, which tasks can "add"
+   * values to using the `+=` method. Only the driver can access the accumulator's `value`.
+   */
+  @deprecated("use AccumulatorV2", "2.0.0")
+  def accumulator[T](initialValue: T)(implicit param: AccumulatorParam[T]): Accumulator[T] = {
+    val acc = new Accumulator(initialValue, param)
+    cleaner.foreach(_.registerAccumulatorForCleanup(acc.newAcc))
+    acc
+  }
+
+  /**
+   * Create an [[org.apache.spark.Accumulator]] variable of a given type, with a name for display
+   * in the Spark UI. Tasks can "add" values to the accumulator using the `+=` method. Only the
+   * driver can access the accumulator's `value`.
+   */
+  @deprecated("use AccumulatorV2", "2.0.0")
+  def accumulator[T](initialValue: T, name: String)(implicit param: AccumulatorParam[T])
+    : Accumulator[T] = {
+    val acc = new Accumulator(initialValue, param, Option(name))
+    cleaner.foreach(_.registerAccumulatorForCleanup(acc.newAcc))
+    acc
+  }
+
+  /**
+   * Create an [[org.apache.spark.Accumulable]] shared variable, to which tasks can add values
+   * with `+=`. Only the driver can access the accumulable's `value`.
+   * @tparam R accumulator result type
+   * @tparam T type that can be added to the accumulator
+   */
+  @deprecated("use AccumulatorV2", "2.0.0")
+  def accumulable[R, T](initialValue: R)(implicit param: AccumulableParam[R, T])
+    : Accumulable[R, T] = {
+    val acc = new Accumulable(initialValue, param)
+    cleaner.foreach(_.registerAccumulatorForCleanup(acc.newAcc))
+    acc
+  }
+
+  /**
+   * Create an [[org.apache.spark.Accumulable]] shared variable, with a name for display in the
+   * Spark UI. Tasks can add values to the accumulable using the `+=` operator. Only the driver can
+   * access the accumulable's `value`.
+   * @tparam R accumulator result type
+   * @tparam T type that can be added to the accumulator
+   */
+  @deprecated("use AccumulatorV2", "2.0.0")
+  def accumulable[R, T](initialValue: R, name: String)(implicit param: AccumulableParam[R, T])
+    : Accumulable[R, T] = {
+    val acc = new Accumulable(initialValue, param, Option(name))
+    cleaner.foreach(_.registerAccumulatorForCleanup(acc.newAcc))
+    acc
+  }
+
+  /**
+   * Create an accumulator from a "mutable collection" type.
+   *
+   * Growable and TraversableOnce are the standard APIs that guarantee += and ++=, implemented by
+   * standard mutable collections. So you can use this with mutable Map, Set, etc.
+   */
+  @deprecated("use AccumulatorV2", "2.0.0")
+  def accumulableCollection[R <% Growable[T] with TraversableOnce[T] with Serializable: ClassTag, T]
+      (initialValue: R): Accumulable[R, T] = {
+    // TODO the context bound (<%) above should be replaced with simple type bound and implicit
+    // conversion but is a breaking change. This should be fixed in Spark 3.x.
+    val param = new GrowableAccumulableParam[R, T]
+    val acc = new Accumulable(initialValue, param)
+    cleaner.foreach(_.registerAccumulatorForCleanup(acc.newAcc))
+    acc
+  }
+
+  /**
    * Register the given accumulator.
    *
    * @note Accumulators must be registered before use, or it will throw exception.
@@ -1443,9 +1488,7 @@ class SparkContext(config: SparkConf) extends SafeLogging {
       "Can not directly broadcast RDDs; instead, call collect() and broadcast the result.")
     val bc = env.broadcastManager.newBroadcast[T](value, isLocal)
     val callSite = getCallSite
-    safeLogInfo("Created broadcast",
-      SafeArg.of("broadcastId", bc.id),
-      UnsafeArg.of("from", callSite.shortForm))
+    logInfo("Created broadcast " + bc.id + " from " + callSite.shortForm)
     cleaner.foreach(_.registerBroadcastForCleanup(bc))
     bc
   }
@@ -1488,7 +1531,7 @@ class SparkContext(config: SparkConf) extends SafeLogging {
     val schemeCorrectedPath = uri.getScheme match {
       case null => new File(path).getCanonicalFile.toURI.toString
       case "local" =>
-        safeLogWarning("File with 'local' scheme is not supported to add to file server, since " +
+        logWarning("File with 'local' scheme is not supported to add to file server, since " +
           "it is already available on every node.")
         return
       case _ => path
@@ -1519,19 +1562,15 @@ class SparkContext(config: SparkConf) extends SafeLogging {
     }
     val timestamp = System.currentTimeMillis
     if (addedFiles.putIfAbsent(key, timestamp).isEmpty) {
-      safeLogInfo("Added file",
-        UnsafeArg.of("path", path),
-        UnsafeArg.of("key", key),
-        SafeArg.of("timestamp", timestamp))
+      logInfo(s"Added file $path at $key with timestamp $timestamp")
       // Fetch the file locally so that closures which are run on the driver can still use the
       // SparkFiles API to access files.
       Utils.fetchFile(uri.toString, new File(SparkFiles.getRootDirectory()), conf,
         env.securityManager, hadoopConfiguration, timestamp, useCache = false)
       postEnvironmentUpdate()
     } else {
-      safeLogWarning("The path has been added already. Overwriting of added paths " +
-       "is not supported in the current version.",
-        UnsafeArg.of("path", path))
+      logWarning(s"The path $path has been added already. Overwriting of added paths " +
+       "is not supported in the current version.")
     }
   }
 
@@ -1558,7 +1597,7 @@ class SparkContext(config: SparkConf) extends SafeLogging {
       case b: ExecutorAllocationClient =>
         b.getExecutorIds()
       case _ =>
-        safeLogWarning("Requesting executors is not supported by current scheduler.")
+        logWarning("Requesting executors is not supported by current scheduler.")
         Nil
     }
   }
@@ -1596,7 +1635,7 @@ class SparkContext(config: SparkConf) extends SafeLogging {
       case b: ExecutorAllocationClient =>
         b.requestTotalExecutors(numExecutors, localityAwareTasks, hostToLocalTaskCount)
       case _ =>
-        safeLogWarning("Requesting executors is not supported by current scheduler.")
+        logWarning("Requesting executors is not supported by current scheduler.")
         false
     }
   }
@@ -1612,7 +1651,7 @@ class SparkContext(config: SparkConf) extends SafeLogging {
       case b: ExecutorAllocationClient =>
         b.requestExecutors(numAdditionalExecutors)
       case _ =>
-        safeLogWarning("Requesting executors is not supported by current scheduler.")
+        logWarning("Requesting executors is not supported by current scheduler.")
         false
     }
   }
@@ -1639,7 +1678,7 @@ class SparkContext(config: SparkConf) extends SafeLogging {
         b.killExecutors(executorIds, adjustTargetNumExecutors = true, countFailures = false,
           force = true).nonEmpty
       case _ =>
-        safeLogWarning("Killing executors is not supported by current scheduler.")
+        logWarning("Killing executors is not supported by current scheduler.")
         false
     }
   }
@@ -1678,7 +1717,7 @@ class SparkContext(config: SparkConf) extends SafeLogging {
         b.killExecutors(Seq(executorId), adjustTargetNumExecutors = false, countFailures = true,
           force = true).nonEmpty
       case _ =>
-        safeLogWarning("Killing executors is not supported by current scheduler.")
+        logWarning("Killing executors is not supported by current scheduler.")
         false
     }
   }
@@ -1805,13 +1844,13 @@ class SparkContext(config: SparkConf) extends SafeLogging {
         env.rpcEnv.fileServer.addJar(file)
       } catch {
         case NonFatal(e) =>
-          safeLogError("Failed to add jar to Spark environment", e, UnsafeArg.of("path", path))
+          logError(s"Failed to add $path to Spark environment", e)
           null
       }
     }
 
     if (path == null) {
-      safeLogWarning("null specified as parameter to addJar")
+      logWarning("null specified as parameter to addJar")
     } else {
       val key = if (path.contains("\\")) {
         // For local paths with backslashes on Windows, URI throws an exception
@@ -1835,15 +1874,11 @@ class SparkContext(config: SparkConf) extends SafeLogging {
       if (key != null) {
         val timestamp = System.currentTimeMillis
         if (addedJars.putIfAbsent(key, timestamp).isEmpty) {
-          safeLogInfo("Added JAR",
-            UnsafeArg.of("path", path),
-            UnsafeArg.of("key", key),
-            SafeArg.of("timestamp", timestamp))
+          logInfo(s"Added JAR $path at $key with timestamp $timestamp")
           postEnvironmentUpdate()
         } else {
-          safeLogWarning("The jar has been added already. Overwriting of added jars " +
-            "is not supported in the current version.",
-            UnsafeArg.of("path", path))
+          logWarning(s"The jar $path has been added already. Overwriting of added jars " +
+            "is not supported in the current version.")
         }
       }
     }
@@ -1853,40 +1888,6 @@ class SparkContext(config: SparkConf) extends SafeLogging {
    * Returns a list of jar files that are added to resources.
    */
   def listJars(): Seq[String] = addedJars.keySet.toSeq
-
-  private[this] def condaEnvironmentOrFail(): CondaEnvironment = {
-    condaEnvironment().getOrElse(sys.error("A conda environment was not set up."))
-  }
-
-  /**
-   * Add a set of conda packages (identified by <a
-   * href="https://conda.io/docs/spec.html#build-version-spec">package match specification</a>
-   * for all tasks to be executed on this SparkContext in the future.
-   */
-  def addCondaPackages(packages: Seq[String]): Unit = {
-    condaEnvironmentOrFail().installPackages(packages)
-  }
-
-  def getTransitiveCondaPackageUrls(): List[String] = {
-    condaEnvironmentOrFail().getTransitivePackageUrls()
-  }
-
-  def addCondaChannel(url: String): Unit = {
-    condaEnvironmentOrFail().addChannel(url)
-  }
-
-  def setCondaChannels(urls: Seq[String]): Unit = {
-    condaEnvironmentOrFail().setChannels(urls)
-  }
-
-  def setPackageUrlsUserInfo(userInfo: Option[String]): Unit = {
-    condaEnvironmentOrFail().setPackageUrlsUserInfo(userInfo)
-  }
-
-  private[spark] def buildCondaInstructions(): Option[CondaSetupInstructions] = {
-    condaEnvironment().map(_.buildSetupInstructions)
-  }
-
 
   /**
    * When stopping SparkContext inside Spark components, it's easy to cause dead-lock since Spark
@@ -1902,7 +1903,7 @@ class SparkContext(config: SparkConf) extends SafeLogging {
           SparkContext.this.stop()
         } catch {
           case e: Throwable =>
-            safeLogError("Error", e, UnsafeArg.of("message", e.getMessage))
+            logError(e.getMessage, e)
             throw e
         }
       }
@@ -1919,7 +1920,7 @@ class SparkContext(config: SparkConf) extends SafeLogging {
     // Use the stopping variable to ensure no contention for the stop scenario.
     // Still track the stopped variable for use elsewhere in the code.
     if (!stopped.compareAndSet(false, true)) {
-      safeLogInfo("SparkContext already stopped.")
+      logInfo("SparkContext already stopped.")
       return
     }
     if (_shutdownHookRef != null) {
@@ -1928,9 +1929,6 @@ class SparkContext(config: SparkConf) extends SafeLogging {
 
     Utils.tryLogNonFatalError {
       postApplicationEnd()
-    }
-    Utils.tryLogNonFatalError {
-      _driverLogger.foreach(_.stop())
     }
     Utils.tryLogNonFatalError {
       _ui.foreach(_.stop())
@@ -1961,13 +1959,6 @@ class SparkContext(config: SparkConf) extends SafeLogging {
     Utils.tryLogNonFatalError {
       _eventLogger.foreach(_.stop())
     }
-    if (_heartbeater != null) {
-      Utils.tryLogNonFatalError {
-        _heartbeater.stop()
-      }
-      _heartbeater = null
-    }
-    _shuffleDriverComponents.cleanupApplication()
     if (env != null && _heartbeatReceiver != null) {
       Utils.tryLogNonFatalError {
         env.rpcEnv.stop(_heartbeatReceiver)
@@ -1992,7 +1983,7 @@ class SparkContext(config: SparkConf) extends SafeLogging {
     localProperties.remove()
     // Unset YARN mode system env variable, to allow switching between cluster types.
     SparkContext.clearActiveContext()
-    safeLogInfo("Successfully stopped SparkContext")
+    logInfo("Successfully stopped SparkContext")
   }
 
 
@@ -2063,10 +2054,9 @@ class SparkContext(config: SparkConf) extends SafeLogging {
     }
     val callSite = getCallSite
     val cleanedFunc = clean(func)
-    safeLogInfo("Starting job", UnsafeArg.of("callSite", callSite.shortForm))
+    logInfo("Starting job: " + callSite.shortForm)
     if (conf.getBoolean("spark.logLineage", false)) {
-      safeLogInfo("RDD's recursive dependencies",
-        UnsafeArg.of("dependencies", rdd.toDebugString))
+      logInfo("RDD's recursive dependencies:\n" + rdd.toDebugString)
     }
     dagScheduler.runJob(rdd, cleanedFunc, partitions, callSite, resultHandler, localProperties.get)
     progressBar.foreach(_.finishAll())
@@ -2187,15 +2177,13 @@ class SparkContext(config: SparkConf) extends SafeLogging {
       timeout: Long): PartialResult[R] = {
     assertNotStopped()
     val callSite = getCallSite
-    safeLogInfo("Starting job", UnsafeArg.of("callSite", callSite.shortForm))
+    logInfo("Starting job: " + callSite.shortForm)
     val start = System.nanoTime
     val cleanedFunc = clean(func)
     val result = dagScheduler.runApproximateJob(rdd, cleanedFunc, evaluator, callSite, timeout,
       localProperties.get)
-    safeLogInfo(
-      "Job finished",
-      UnsafeArg.of("callSite", callSite.shortForm),
-      SafeArg.of("durationInSeconds", (System.nanoTime - start) / 1e9))
+    logInfo(
+      "Job finished: " + callSite.shortForm + ", took " + (System.nanoTime - start) / 1e9 + " s")
     result
   }
 
@@ -2351,10 +2339,9 @@ class SparkContext(config: SparkConf) extends SafeLogging {
     // its own local file system, which is incorrect because the checkpoint files
     // are actually on the executor machines.
     if (!isLocal && Utils.nonLocalPaths(directory).isEmpty) {
-      safeLogWarning("Spark is not running in local mode, therefore the checkpoint directory " +
-        "must not be on the local filesystem. Directory " +
-        "appears to be on the local filesystem.",
-        UnsafeArg.of("directory", directory))
+      logWarning("Spark is not running in local mode, therefore the checkpoint directory " +
+        s"must not be on the local filesystem. Directory '$directory' " +
+        "appears to be on the local filesystem.")
     }
 
     checkpointDir = Option(directory).map { dir =>
@@ -2400,8 +2387,7 @@ class SparkContext(config: SparkConf) extends SafeLogging {
         val listeners = Utils.loadExtensions(classOf[SparkListenerInterface], classNames, conf)
         listeners.foreach { listener =>
           listenerBus.addToSharedQueue(listener)
-          safeLogInfo("Registered listener",
-            SafeArg.of("listenerName", listener.getClass().getName()))
+          logInfo(s"Registered listener ${listener.getClass().getName()}")
         }
       }
     } catch {
@@ -2422,9 +2408,7 @@ class SparkContext(config: SparkConf) extends SafeLogging {
     // Note: this code assumes that the task scheduler has been initialized and has contacted
     // the cluster manager to get an application ID (in case the cluster manager provides one).
     listenerBus.post(SparkListenerApplicationStart(appName, Some(applicationId),
-      startTime, sparkUser, applicationAttemptId, schedulerBackend.getDriverLogUrls,
-      schedulerBackend.getDriverAttributes))
-    _driverLogger.foreach(_.startSync(_hadoopConfiguration))
+      startTime, sparkUser, applicationAttemptId, schedulerBackend.getDriverLogUrls))
   }
 
   /** Post the application end event */
@@ -2438,32 +2422,24 @@ class SparkContext(config: SparkConf) extends SafeLogging {
       val schedulingMode = getSchedulingMode.toString
       val addedJarPaths = addedJars.keys.toSeq
       val addedFilePaths = addedFiles.keys.toSeq
-      val environmentDetails = SparkEnv.environmentDetails(conf, hadoopConfiguration,
-        schedulingMode, addedJarPaths, addedFilePaths)
+      val environmentDetails = SparkEnv.environmentDetails(conf, schedulingMode, addedJarPaths,
+        addedFilePaths)
       val environmentUpdate = SparkListenerEnvironmentUpdate(environmentDetails)
       listenerBus.post(environmentUpdate)
     }
   }
 
-  /** Reports heartbeat metrics for the driver. */
-  private def reportHeartBeat(): Unit = {
-    val driverUpdates = _heartbeater.getCurrentMetrics()
-    val accumUpdates = new Array[(Long, Int, Int, Seq[AccumulableInfo])](0)
-    listenerBus.post(SparkListenerExecutorMetricsUpdate("driver", accumUpdates,
-      Some(driverUpdates)))
-  }
-
   // In order to prevent multiple SparkContexts from being active at the same time, mark this
   // context as having finished construction.
   // NOTE: this must be placed at the end of the SparkContext constructor.
-  SparkContext.setActiveContext(this)
+  SparkContext.setActiveContext(this, allowMultipleContexts)
 }
 
 /**
  * The SparkContext object contains a number of implicit conversions and parameters for use with
  * various Spark features.
  */
-object SparkContext extends SafeLogging {
+object SparkContext extends Logging {
   private val VALID_LOG_LEVELS =
     Set("ALL", "DEBUG", "ERROR", "FATAL", "INFO", "OFF", "TRACE", "WARN")
 
@@ -2473,18 +2449,18 @@ object SparkContext extends SafeLogging {
   private val SPARK_CONTEXT_CONSTRUCTOR_LOCK = new Object()
 
   /**
-   * The active, fully-constructed SparkContext. If no SparkContext is active, then this is `null`.
+   * The active, fully-constructed SparkContext.  If no SparkContext is active, then this is `null`.
    *
-   * Access to this field is guarded by `SPARK_CONTEXT_CONSTRUCTOR_LOCK`.
+   * Access to this field is guarded by SPARK_CONTEXT_CONSTRUCTOR_LOCK.
    */
   private val activeContext: AtomicReference[SparkContext] =
     new AtomicReference[SparkContext](null)
 
   /**
-   * Points to a partially-constructed SparkContext if another thread is in the SparkContext
+   * Points to a partially-constructed SparkContext if some thread is in the SparkContext
    * constructor, or `None` if no SparkContext is being constructed.
    *
-   * Access to this field is guarded by `SPARK_CONTEXT_CONSTRUCTOR_LOCK`.
+   * Access to this field is guarded by SPARK_CONTEXT_CONSTRUCTOR_LOCK
    */
   private var contextBeingConstructed: Option[SparkContext] = None
 
@@ -2492,16 +2468,24 @@ object SparkContext extends SafeLogging {
    * Called to ensure that no other SparkContext is running in this JVM.
    *
    * Throws an exception if a running context is detected and logs a warning if another thread is
-   * constructing a SparkContext. This warning is necessary because the current locking scheme
+   * constructing a SparkContext.  This warning is necessary because the current locking scheme
    * prevents us from reliably distinguishing between cases where another context is being
    * constructed and cases where another constructor threw an exception.
    */
-  private def assertNoOtherContextIsRunning(sc: SparkContext): Unit = {
+  private def assertNoOtherContextIsRunning(
+      sc: SparkContext,
+      allowMultipleContexts: Boolean): Unit = {
     SPARK_CONTEXT_CONSTRUCTOR_LOCK.synchronized {
       Option(activeContext.get()).filter(_ ne sc).foreach { ctx =>
-          val errMsg = "Only one SparkContext should be running in this JVM (see SPARK-2243)." +
+          val errMsg = "Only one SparkContext may be running in this JVM (see SPARK-2243)." +
+            " To ignore this error, set spark.driver.allowMultipleContexts = true. " +
             s"The currently running SparkContext was created at:\n${ctx.creationSite.longForm}"
-          throw new SparkException(errMsg)
+          val exception = new SparkException(errMsg)
+          if (allowMultipleContexts) {
+            logWarning("Multiple running SparkContexts detected in the same JVM!", exception)
+          } else {
+            throw exception
+          }
         }
 
       contextBeingConstructed.filter(_ ne sc).foreach { otherContext =>
@@ -2509,10 +2493,11 @@ object SparkContext extends SafeLogging {
         // its creationSite field being null:
         val otherContextCreationSite =
           Option(otherContext.creationSite).map(_.longForm).getOrElse("unknown location")
-        safeLogWarning("Another SparkContext is being constructed (or threw an exception in its" +
+        val warnMsg = "Another SparkContext is being constructed (or threw an exception in its" +
           " constructor).  This may indicate an error, since only one SparkContext may be" +
-          " running in this JVM (see SPARK-2243).",
-          UnsafeArg.of("otherContextCreationSite", otherContextCreationSite))
+          " running in this JVM (see SPARK-2243)." +
+          s" The other SparkContext was created at:\n$otherContextCreationSite"
+        logWarning(warnMsg)
       }
     }
   }
@@ -2522,6 +2507,8 @@ object SparkContext extends SafeLogging {
    * singleton object. Because we can only have one active SparkContext per JVM,
    * this is useful when applications may wish to share a SparkContext.
    *
+   * @note This function cannot be used to create multiple SparkContext instances
+   * even if multiple contexts are allowed.
    * @param config `SparkConfig` that will be used for initialisation of the `SparkContext`
    * @return current `SparkContext` (or a new one if it wasn't created before the function call)
    */
@@ -2530,10 +2517,10 @@ object SparkContext extends SafeLogging {
     // from assertNoOtherContextIsRunning within setActiveContext
     SPARK_CONTEXT_CONSTRUCTOR_LOCK.synchronized {
       if (activeContext.get() == null) {
-        setActiveContext(new SparkContext(config))
+        setActiveContext(new SparkContext(config), allowMultipleContexts = false)
       } else {
         if (config.getAll.nonEmpty) {
-          safeLogWarning("Using an existing SparkContext; some configuration may not take effect.")
+          logWarning("Using an existing SparkContext; some configuration may not take effect.")
         }
       }
       activeContext.get()
@@ -2547,12 +2534,14 @@ object SparkContext extends SafeLogging {
    *
    * This method allows not passing a SparkConf (useful if just retrieving).
    *
+   * @note This function cannot be used to create multiple SparkContext instances
+   * even if multiple contexts are allowed.
    * @return current `SparkContext` (or a new one if wasn't created before the function call)
    */
   def getOrCreate(): SparkContext = {
     SPARK_CONTEXT_CONSTRUCTOR_LOCK.synchronized {
       if (activeContext.get() == null) {
-        setActiveContext(new SparkContext())
+        setActiveContext(new SparkContext(), allowMultipleContexts = false)
       }
       activeContext.get()
     }
@@ -2567,14 +2556,16 @@ object SparkContext extends SafeLogging {
 
   /**
    * Called at the beginning of the SparkContext constructor to ensure that no SparkContext is
-   * running. Throws an exception if a running context is detected and logs a warning if another
-   * thread is constructing a SparkContext. This warning is necessary because the current locking
+   * running.  Throws an exception if a running context is detected and logs a warning if another
+   * thread is constructing a SparkContext.  This warning is necessary because the current locking
    * scheme prevents us from reliably distinguishing between cases where another context is being
    * constructed and cases where another constructor threw an exception.
    */
-  private[spark] def markPartiallyConstructed(sc: SparkContext): Unit = {
+  private[spark] def markPartiallyConstructed(
+      sc: SparkContext,
+      allowMultipleContexts: Boolean): Unit = {
     SPARK_CONTEXT_CONSTRUCTOR_LOCK.synchronized {
-      assertNoOtherContextIsRunning(sc)
+      assertNoOtherContextIsRunning(sc, allowMultipleContexts)
       contextBeingConstructed = Some(sc)
     }
   }
@@ -2583,16 +2574,18 @@ object SparkContext extends SafeLogging {
    * Called at the end of the SparkContext constructor to ensure that no other SparkContext has
    * raced with this constructor and started.
    */
-  private[spark] def setActiveContext(sc: SparkContext): Unit = {
+  private[spark] def setActiveContext(
+      sc: SparkContext,
+      allowMultipleContexts: Boolean): Unit = {
     SPARK_CONTEXT_CONSTRUCTOR_LOCK.synchronized {
-      assertNoOtherContextIsRunning(sc)
+      assertNoOtherContextIsRunning(sc, allowMultipleContexts)
       contextBeingConstructed = None
       activeContext.set(sc)
     }
   }
 
   /**
-   * Clears the active SparkContext metadata. This is called by `SparkContext#stop()`. It's
+   * Clears the active SparkContext metadata.  This is called by `SparkContext#stop()`.  It's
    * also called in unit tests to prevent a flood of warnings from test suites that don't / can't
    * properly clean up their SparkContexts.
    */
@@ -2605,7 +2598,6 @@ object SparkContext extends SafeLogging {
   private[spark] val SPARK_JOB_DESCRIPTION = "spark.job.description"
   private[spark] val SPARK_JOB_GROUP_ID = "spark.jobGroup.id"
   private[spark] val SPARK_JOB_INTERRUPT_ON_CANCEL = "spark.job.interruptOnCancel"
-  private[spark] val SPARK_SCHEDULER_POOL = "spark.scheduler.pool"
   private[spark] val RDD_SCOPE_KEY = "spark.rdd.scope"
   private[spark] val RDD_SCOPE_NO_OVERRIDE_KEY = "spark.rdd.scope.noOverride"
 
@@ -2707,9 +2699,9 @@ object SparkContext extends SafeLogging {
       case "local" => 1
       case SparkMasterRegex.LOCAL_N_REGEX(threads) => convertToInt(threads)
       case SparkMasterRegex.LOCAL_N_FAILURES_REGEX(threads, _) => convertToInt(threads)
-      case "yarn" | SparkMasterRegex.KUBERNETES_REGEX(_) =>
-        if (conf != null && conf.get(SUBMIT_DEPLOY_MODE) == "cluster") {
-          conf.getInt(DRIVER_CORES.key, 0)
+      case "yarn" =>
+        if (conf != null && conf.getOption("spark.submit.deployMode").contains("cluster")) {
+          conf.getInt("spark.driver.cores", 0)
         } else {
           0
         }
@@ -2771,7 +2763,7 @@ object SparkContext extends SafeLogging {
         val memoryPerSlaveInt = memoryPerSlave.toInt
         if (sc.executorMemory > memoryPerSlaveInt) {
           throw new SparkException(
-            "Asked to launch cluster with %d MiB RAM / worker but requested %d MiB/worker".format(
+            "Asked to launch cluster with %d MB RAM / worker but requested %d MB/worker".format(
               memoryPerSlaveInt, sc.executorMemory))
         }
 
@@ -2828,8 +2820,6 @@ private object SparkMasterRegex {
   val LOCAL_CLUSTER_REGEX = """local-cluster\[\s*([0-9]+)\s*,\s*([0-9]+)\s*,\s*([0-9]+)\s*]""".r
   // Regular expression for connecting to Spark deploy clusters
   val SPARK_REGEX = """spark://(.*)""".r
-  // Regular expression for connecting to kubernetes clusters
-  val KUBERNETES_REGEX = """k8s://(.*)""".r
 }
 
 /**

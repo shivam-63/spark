@@ -22,7 +22,7 @@ import java.util.Arrays
 
 import org.apache.spark.{SparkEnv, SparkException}
 import org.apache.spark.api.java.JavaSparkContext
-import org.apache.spark.internal.config._
+import org.apache.spark.api.python.PythonUtils
 
 private[spark] object RUtils {
   // Local path where R binary packages built from R source code contained in the spark
@@ -63,7 +63,7 @@ private[spark] object RUtils {
         (sys.props("spark.master"), sys.props("spark.submit.deployMode"))
       } else {
         val sparkConf = SparkEnv.get.conf
-        (sparkConf.get("spark.master"), sparkConf.get(SUBMIT_DEPLOY_MODE))
+        (sparkConf.get("spark.master"), sparkConf.get("spark.submit.deployMode", "client"))
       }
 
     val isYarnCluster = master != null && master.contains("yarn") && deployMode == "cluster"
@@ -97,14 +97,6 @@ private[spark] object RUtils {
     }
   }
 
-  /** Finds a script in a sequence of possible SparkR installation directories. */
-  def getSparkRScript(rLibDir: Seq[String], scriptPath: String): String = {
-    rLibDir.find(dir => new File(dir + scriptPath).exists).getOrElse(
-      throw new SparkException(
-        s"Script $scriptPath not found in any SparkR installation directory.")
-    ) + scriptPath
-  }
-
   /** Check if R is installed before running tests that use R commands. */
   def isRInstalled: Boolean = {
     try {
@@ -115,7 +107,5 @@ private[spark] object RUtils {
     }
   }
 
-  def isEncryptionEnabled(sc: JavaSparkContext): Boolean = {
-    sc.conf.get(org.apache.spark.internal.config.IO_ENCRYPTION_ENABLED)
-  }
+  def getEncryptionEnabled(sc: JavaSparkContext): Boolean = PythonUtils.getEncryptionEnabled(sc)
 }
