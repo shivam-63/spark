@@ -28,6 +28,7 @@ import org.apache.spark.SparkConf
 import org.apache.spark.deploy.security.HadoopDelegationTokenManager
 import org.apache.spark.deploy.yarn.YarnSparkHadoopUtil
 import org.apache.spark.internal.Logging
+import org.apache.spark.rpc.RpcEndpointRef
 import org.apache.spark.util.Utils
 
 /**
@@ -36,11 +37,12 @@ import org.apache.spark.util.Utils
  * in [[HadoopDelegationTokenManager]].
  */
 private[yarn] class YARNHadoopDelegationTokenManager(
-    sparkConf: SparkConf,
-    hadoopConf: Configuration) extends Logging {
+    _sparkConf: SparkConf,
+    _hadoopConf: Configuration,
+    _schedulerRef: RpcEndpointRef)
+  extends HadoopDelegationTokenManager(_sparkConf, _hadoopConf, _schedulerRef) {
 
-  private val delegationTokenManager = new HadoopDelegationTokenManager(sparkConf, hadoopConf,
-    conf => YarnSparkHadoopUtil.hadoopFSsToAccess(sparkConf, conf))
+
 
   // public for testing
   val credentialProviders = getCredentialProviders
@@ -56,7 +58,7 @@ private[yarn] class YARNHadoopDelegationTokenManager(
    * @return Time after which the fetched delegation tokens should be renewed.
    */
   def obtainDelegationTokens(hadoopConf: Configuration, creds: Credentials): Long = {
-    val superInterval = delegationTokenManager.obtainDelegationTokens(hadoopConf, creds)
+    val superInterval = super.obtainDelegationTokens( creds)
 
     credentialProviders.values.flatMap { provider =>
       if (provider.credentialsRequired(hadoopConf)) {
@@ -73,7 +75,7 @@ private[yarn] class YARNHadoopDelegationTokenManager(
     val providers = loadCredentialProviders
 
     providers.
-      filter { p => delegationTokenManager.isServiceEnabled(p.serviceName) }
+      filter { p => super.isServiceEnabled(p.serviceName) }
       .map { p => (p.serviceName, p) }
       .toMap
   }

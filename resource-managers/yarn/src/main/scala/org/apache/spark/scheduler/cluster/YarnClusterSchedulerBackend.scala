@@ -53,15 +53,16 @@ private[spark] class YarnClusterSchedulerBackend(
       val user = Utils.getCurrentUserName()
       val httpScheme = if (yarnHttpPolicy == "HTTPS_ONLY") "https://" else "http://"
       val baseUrl = s"$httpScheme$httpAddress/node/containerlogs/$containerId/$user"
-      logDebug(s"Base URL for logs: $baseUrl")
+      safeLogDebug(s"Base URL for logs: $baseUrl")
       driverLogs = Some(Map(
         "stdout" -> s"$baseUrl/stdout?start=-4096",
         "stderr" -> s"$baseUrl/stderr?start=-4096"))
     } catch {
       case e: Exception =>
-        logInfo("Error while building AM log links, so AM" +
+        safeLogInfo("Error while building AM log links, so AM" +
           " logs link will not appear in application UI", e)
     }
+
     driverLogs
   }
 }

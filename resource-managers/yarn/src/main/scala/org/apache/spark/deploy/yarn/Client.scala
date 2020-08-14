@@ -50,6 +50,7 @@ import org.apache.hadoop.yarn.util.Records
 import org.apache.spark.{SecurityManager, SparkConf, SparkException}
 import org.apache.spark.deploy.{SparkApplication, SparkHadoopUtil}
 import org.apache.spark.deploy.yarn.config._
+import org.apache.spark.deploy.yarn.config.DRIVER_CORES
 import org.apache.spark.deploy.yarn.security.YARNHadoopDelegationTokenManager
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config._
@@ -305,7 +306,7 @@ private[spark] class Client(
    */
   private def setupSecurityToken(amContainer: ContainerLaunchContext): Unit = {
     val credentials = UserGroupInformation.getCurrentUser().getCredentials()
-    val credentialManager = new YARNHadoopDelegationTokenManager(sparkConf, hadoopConf)
+    val credentialManager = new YARNHadoopDelegationTokenManager(sparkConf, hadoopConf, null)
     credentialManager.obtainDelegationTokens(hadoopConf, credentials)
 
     // When using a proxy user, copy the delegation tokens to the user's credentials. Avoid

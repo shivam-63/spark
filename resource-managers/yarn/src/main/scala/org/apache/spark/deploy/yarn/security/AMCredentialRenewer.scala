@@ -25,7 +25,7 @@ import org.apache.hadoop.security.{Credentials, UserGroupInformation}
 
 import org.apache.spark.SparkConf
 import org.apache.spark.deploy.SparkHadoopUtil
-import org.apache.spark.deploy.yarn.config._
+import org.apache.spark.deploy.yarn.config.KERBEROS_RELOGIN_PERIOD
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config._
 import org.apache.spark.rpc.RpcEndpointRef
@@ -52,11 +52,13 @@ import org.apache.spark.util.ThreadUtils
  */
 private[yarn] class AMCredentialRenewer(
     sparkConf: SparkConf,
-    hadoopConf: Configuration) extends Logging {
+    hadoopConf: Configuration,
+    schedulerRef: RpcEndpointRef) extends Logging {
 
   private val principal = sparkConf.get(PRINCIPAL).get
   private val keytab = sparkConf.get(KEYTAB).get
-  private val credentialManager = new YARNHadoopDelegationTokenManager(sparkConf, hadoopConf)
+  private val credentialManager =
+    new YARNHadoopDelegationTokenManager(sparkConf, hadoopConf, schedulerRef)
 
   private val renewalExecutor: ScheduledExecutorService =
     ThreadUtils.newDaemonSingleThreadScheduledExecutor("Credential Refresh Thread")

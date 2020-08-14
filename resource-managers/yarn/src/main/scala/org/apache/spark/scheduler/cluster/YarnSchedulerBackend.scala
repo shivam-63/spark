@@ -122,7 +122,7 @@ private[spark] abstract class YarnSchedulerBackend(
    */
   override def applicationId(): String = {
     appId.map(_.toString).getOrElse {
-      logWarning("Application ID is not initialized yet.")
+      safeLogWarning("Application ID is not initialized yet.")
       super.applicationId
     }
   }
@@ -170,16 +170,16 @@ private[spark] abstract class YarnSchedulerBackend(
       filterName != null && filterName.nonEmpty &&
       filterParams != null && filterParams.nonEmpty
     if (hasFilter) {
-      logInfo(s"Add WebUI Filter. $filterName, $filterParams, $proxyBase")
+      safeLogInfo(s"Add WebUI Filter. $filterName, $filterParams, $proxyBase")
       conf.set("spark.ui.filters", filterName)
       filterParams.foreach { case (k, v) => conf.set(s"spark.$filterName.param.$k", v) }
       scheduler.sc.ui.foreach { ui => JettyUtils.addFilters(ui.getHandlers, conf) }
     }
   }
 
-  override def createDriverEndpoint(properties: Seq[(String, String)]): DriverEndpoint = {
-    new YarnDriverEndpoint(rpcEnv, properties)
-  }
+//  override def createDriverEndpoint(properties: Seq[(String, String)]): DriverEndpoint = {
+//    new YarnDriverEndpoint(rpcEnv, properties)
+//  }
 
   /**
    * Reset the state of SchedulerBackend to the initial state. This is happened when AM is failed
@@ -197,7 +197,7 @@ private[spark] abstract class YarnSchedulerBackend(
    * status when the executor is disconnected.
    */
   private class YarnDriverEndpoint(rpcEnv: RpcEnv, sparkProperties: Seq[(String, String)])
-      extends DriverEndpoint(rpcEnv, sparkProperties) {
+      extends DriverEndpoint() {
 
     /**
      * When onDisconnected is received at the driver endpoint, the superclass DriverEndpoint

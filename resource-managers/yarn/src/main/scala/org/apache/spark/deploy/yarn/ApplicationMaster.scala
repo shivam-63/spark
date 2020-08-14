@@ -41,14 +41,17 @@ import org.apache.spark._
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.deploy.history.HistoryServer
 import org.apache.spark.deploy.yarn.config._
+import org.apache.spark.deploy.yarn.config.EXECUTOR_CORES
 import org.apache.spark.deploy.yarn.security.AMCredentialRenewer
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config._
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.rpc._
+import org.apache.spark.rpc.RpcEndpointRef
 import org.apache.spark.scheduler.cluster.{CoarseGrainedSchedulerBackend, YarnSchedulerBackend}
 import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages._
 import org.apache.spark.util._
+
 
 /**
  * Common application master functionality for Spark on Yarn.
@@ -100,7 +103,7 @@ private[spark] class ApplicationMaster(args: ApplicationMasterArguments) extends
   }
 
   private val credentialRenewer: Option[AMCredentialRenewer] = sparkConf.get(KEYTAB).map { _ =>
-    new AMCredentialRenewer(sparkConf, yarnConf)
+    new AMCredentialRenewer(sparkConf, yarnConf, null)
   }
 
   private val ugi = credentialRenewer match {
