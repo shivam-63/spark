@@ -98,7 +98,7 @@ public final class UnsafeFixedWidthAggregationMap {
     this.groupingKeyProjection = UnsafeProjection.create(groupingKeySchema);
     this.groupingKeySchema = groupingKeySchema;
     this.map = new BytesToBytesMap(
-      taskContext.taskMemoryManager(), initialCapacity, pageSizeBytes, true);
+      taskContext.taskMemoryManager(), initialCapacity, pageSizeBytes);
 
     // Initialize the buffer for aggregation value
     final UnsafeProjection valueProjection = UnsafeProjection.create(aggregationBufferSchema);
@@ -226,11 +226,18 @@ public final class UnsafeFixedWidthAggregationMap {
   }
 
   /**
+   * Gets the average bucket list iterations per lookup in the underlying `BytesToBytesMap`.
+   */
+  public double getAvgHashProbeBucketListIterations() {
+    return map.getAvgHashProbeBucketListIterations();
+  }
+
+  /**
    * Gets the average hash map probe per looking up for the underlying `BytesToBytesMap`.
    */
-  public double getAverageProbesPerLookup() {
-    return map.getAverageProbesPerLookup();
-  }
+//  public double getAverageProbesPerLookup() {
+//    return map.getAverageProbesPerLookup();
+//  }
 
   /**
    * Sorts the map's records in place, spill them to disk, and returns an [[UnsafeKVExternalSorter]]
