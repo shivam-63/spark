@@ -20,6 +20,7 @@ package org.apache.spark.network;
 import java.util.ArrayList;
 import java.util.List;
 
+import com.codahale.metrics.Counter;
 import io.netty.channel.Channel;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.handler.timeout.IdleStateHandler;
@@ -61,6 +62,9 @@ public class TransportContext {
   private final TransportConf conf;
   private final RpcHandler rpcHandler;
   private final boolean closeIdleConnections;
+
+  // Number of registered connections to the shuffle service
+  private Counter registeredConnections = new Counter();
 
   /**
    * Force to create MessageEncoder and MessageDecoder so that we can make sure they will be created
@@ -174,4 +178,8 @@ public class TransportContext {
   }
 
   public TransportConf getConf() { return conf; }
+
+  public Counter getRegisteredConnections() {
+    return registeredConnections;
+  }
 }
