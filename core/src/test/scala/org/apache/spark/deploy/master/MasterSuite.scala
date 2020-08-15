@@ -39,10 +39,6 @@ import other.supplier.{CustomPersistenceEngine, CustomRecoveryModeFactory}
 import org.apache.spark.{SecurityManager, SparkConf, SparkFunSuite}
 import org.apache.spark.deploy._
 import org.apache.spark.deploy.DeployMessages._
-import org.apache.spark.internal.config._
-import org.apache.spark.internal.config.Deploy._
-import org.apache.spark.internal.config.UI._
-import org.apache.spark.internal.config.Worker._
 import org.apache.spark.rpc.{RpcAddress, RpcEndpoint, RpcEndpointRef, RpcEnv}
 import org.apache.spark.serializer
 
@@ -105,9 +101,10 @@ class MasterSuite extends SparkFunSuite
 
   test("can use a custom recovery mode factory") {
     val conf = new SparkConf(loadDefaults = false)
-    conf.set(RECOVERY_MODE, "CUSTOM")
-    conf.set(RECOVERY_MODE_FACTORY, classOf[CustomRecoveryModeFactory].getCanonicalName)
-    conf.set(MASTER_REST_SERVER_ENABLED, false)
+    conf.set("spark.deploy.recoveryMode", "CUSTOM")
+    conf.set("spark.deploy.recoveryMode.factory",
+      classOf[CustomRecoveryModeFactory].getCanonicalName)
+    conf.set("spark.master.rest.enabled", "false")
 
     val instantiationAttempts = CustomRecoveryModeFactory.instantiationAttempts
 
@@ -189,9 +186,10 @@ class MasterSuite extends SparkFunSuite
 
   test("master correctly recover the application") {
     val conf = new SparkConf(loadDefaults = false)
-    conf.set(RECOVERY_MODE, "CUSTOM")
-    conf.set(RECOVERY_MODE_FACTORY, classOf[FakeRecoveryModeFactory].getCanonicalName)
-    conf.set(MASTER_REST_SERVER_ENABLED, false)
+    conf.set("spark.deploy.recoveryMode", "CUSTOM")
+    conf.set("spark.deploy.recoveryMode.factory",
+      classOf[FakeRecoveryModeFactory].getCanonicalName)
+    conf.set("spark.master.rest.enabled", "false")
 
     val fakeAppInfo = makeAppInfo(1024)
     val fakeWorkerInfo = makeWorkerInfo(8192, 16)
@@ -288,8 +286,8 @@ class MasterSuite extends SparkFunSuite
     implicit val formats = org.json4s.DefaultFormats
     val reverseProxyUrl = "http://localhost:8080"
     val conf = new SparkConf()
-    conf.set(UI_REVERSE_PROXY, true)
-    conf.set(UI_REVERSE_PROXY_URL, reverseProxyUrl)
+    conf.set("spark.ui.reverseProxy", "true")
+    conf.set("spark.ui.reverseProxyUrl", reverseProxyUrl)
     val localCluster = new LocalSparkCluster(2, 2, 512, conf)
     localCluster.start()
     try {
@@ -637,7 +635,7 @@ class MasterSuite extends SparkFunSuite
   }
 
   test("SPARK-19900: there should be a corresponding driver for the app after relaunching driver") {
-    val conf = new SparkConf().set(WORKER_TIMEOUT, 1L)
+    val conf = new SparkConf().set("spark.worker.timeout", "1")
     val master = makeMaster(conf)
     master.rpcEnv.setupEndpoint(Master.ENDPOINT_NAME, master)
     eventually(timeout(10.seconds)) {

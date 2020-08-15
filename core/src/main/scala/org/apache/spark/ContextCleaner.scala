@@ -25,9 +25,7 @@ import scala.collection.JavaConverters._
 
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.internal.Logging
-import org.apache.spark.internal.config._
 import org.apache.spark.rdd.{RDD, ReliableRDDCheckpointData}
-import org.apache.spark.shuffle.api.ShuffleDriverComponents
 import org.apache.spark.util.{AccumulatorContext, AccumulatorV2, ThreadUtils, Utils}
 
 /**
@@ -59,9 +57,7 @@ private class CleanupTaskWeakReference(
  * to be processed when the associated object goes out of scope of the application. Actual
  * cleanup is performed in a separate daemon thread.
  */
-private[spark] class ContextCleaner(
-    sc: SparkContext,
-    shuffleDriverComponents: ShuffleDriverComponents) extends Logging {
+private[spark] class ContextCleaner(sc: SparkContext) extends Logging {
 
   /**
    * A buffer to ensure that `CleanupTaskWeakReference`s are not garbage collected as long as they
@@ -87,7 +83,8 @@ private[spark] class ContextCleaner(
    * on the driver, this may happen very occasionally or not at all. Not cleaning at all may
    * lead to executors running out of disk space after a while.
    */
-  private val periodicGCInterval = sc.conf.get(CLEANER_PERIODIC_GC_INTERVAL)
+  private val periodicGCInterval =
+    sc.conf.getTimeAsSeconds("spark.cleaner.periodicGC.interval", "30min")
 
   /**
    * Whether the cleaning thread will block on cleanup tasks (other than shuffle, which
@@ -99,7 +96,8 @@ private[spark] class ContextCleaner(
    * for instance, when the driver performs a GC and cleans up all broadcast blocks that are no
    * longer in scope.
    */
-  private val blockOnCleanupTasks = sc.conf.get(CLEANER_REFERENCE_TRACKING_BLOCKING)
+  private val blockOnCleanupTasks = sc.conf.getBoolean(
+    "spark.cleaner.referenceTracking.blocking", true)
 
   /**
    * Whether the cleaning thread will block on shuffle cleanup tasks.
@@ -111,8 +109,8 @@ private[spark] class ContextCleaner(
    * until the real RPC issue (referred to in the comment above `blockOnCleanupTasks`) is
    * resolved.
    */
-  private val blockOnShuffleCleanupTasks =
-    sc.conf.get(CLEANER_REFERENCE_TRACKING_BLOCKING_SHUFFLE)
+  private val blockOnShuffleCleanupTasks = sc.conf.getBoolean(
+    "spark.cleaner.referenceTracking.blocking.shuffle", false)
 
   @volatile private var stopped = false
 
@@ -225,7 +223,7 @@ private[spark] class ContextCleaner(
     try {
       logDebug("Cleaning shuffle " + shuffleId)
       mapOutputTrackerMaster.unregisterShuffle(shuffleId)
-      shuffleDriverComponents.removeShuffle(shuffleId, blocking)
+      blockManagerMaster.removeShuffle(shuffleId, blocking)
       listeners.asScala.foreach(_.shuffleCleaned(shuffleId))
       logInfo("Cleaned shuffle " + shuffleId)
     } catch {
@@ -273,6 +271,7 @@ private[spark] class ContextCleaner(
     }
   }
 
+  private def blockManagerMaster = sc.env.blockManager.master
   private def broadcastManager = sc.env.broadcastManager
   private def mapOutputTrackerMaster = sc.env.mapOutputTracker.asInstanceOf[MapOutputTrackerMaster]
 }

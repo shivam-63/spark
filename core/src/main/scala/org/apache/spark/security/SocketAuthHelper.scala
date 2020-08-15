@@ -17,7 +17,7 @@
 
 package org.apache.spark.security
 
-import java.io.{DataInputStream, DataOutputStream}
+import java.io.{DataInputStream, DataOutputStream, InputStream}
 import java.net.Socket
 import java.nio.charset.StandardCharsets.UTF_8
 
@@ -113,4 +113,5 @@ private[spark] class SocketAuthHelper(conf: SparkConf) {
     dout.write(bytes, 0, bytes.length)
     dout.flush()
   }
+
 }

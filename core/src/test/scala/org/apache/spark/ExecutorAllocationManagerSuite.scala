@@ -19,14 +19,12 @@ package org.apache.spark
 
 import scala.collection.mutable
 
-// import org.mockito.ArgumentMatchers.{any, eq => meq}
-
+import org.mockito.Matchers.{any, eq => meq}
 import org.mockito.Mockito.{mock, never, verify, when}
 import org.scalatest.{BeforeAndAfter, PrivateMethodTester}
 
 import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.internal.config
-import org.apache.spark.internal.config.Tests.TEST_SCHEDULE_INTERVAL
 import org.apache.spark.scheduler._
 import org.apache.spark.scheduler.ExternalClusterManager
 import org.apache.spark.scheduler.cluster.ExecutorInfo
@@ -64,19 +62,19 @@ class ExecutorAllocationManagerSuite
     val conf = new SparkConf()
       .setMaster("myDummyLocalExternalClusterManager")
       .setAppName("test-executor-allocation-manager")
-      .set(config.DYN_ALLOCATION_ENABLED, true)
-      .set(config.DYN_ALLOCATION_TESTING, true)
+      .set("spark.dynamicAllocation.enabled", "true")
+      .set("spark.dynamicAllocation.testing", "true")
     val sc0 = new SparkContext(conf)
     contexts += sc0
     assert(sc0.executorAllocationManager.isDefined)
     sc0.stop()
 
     // Min < 0
-    val conf1 = conf.clone().set(config.DYN_ALLOCATION_MIN_EXECUTORS, -1)
+    val conf1 = conf.clone().set("spark.dynamicAllocation.minExecutors", "-1")
     intercept[SparkException] { contexts += new SparkContext(conf1) }
 
     // Max < 0
-    val conf2 = conf.clone().set(config.DYN_ALLOCATION_MAX_EXECUTORS, -1)
+    val conf2 = conf.clone().set("spark.dynamicAllocation.maxExecutors", "-1")
     intercept[SparkException] { contexts += new SparkContext(conf2) }
 
     // Both min and max, but min > max
@@ -152,12 +150,12 @@ class ExecutorAllocationManagerSuite
     val conf = new SparkConf()
       .setMaster("myDummyLocalExternalClusterManager")
       .setAppName("test-executor-allocation-manager")
-      .set(config.DYN_ALLOCATION_ENABLED, true)
-      .set(config.DYN_ALLOCATION_TESTING, true)
-      .set(config.DYN_ALLOCATION_MAX_EXECUTORS, 15)
-      .set(config.DYN_ALLOCATION_MIN_EXECUTORS, 3)
-      .set(config.DYN_ALLOCATION_EXECUTOR_ALLOCATION_RATIO, divisor)
-      .set(config.EXECUTOR_CORES, cores)
+      .set("spark.dynamicAllocation.enabled", "true")
+      .set("spark.dynamicAllocation.testing", "true")
+      .set("spark.dynamicAllocation.maxExecutors", "15")
+      .set("spark.dynamicAllocation.minExecutors", "3")
+      .set("spark.dynamicAllocation.executorAllocationRatio", divisor.toString)
+      .set("spark.executor.cores", cores.toString)
     val sc = new SparkContext(conf)
     contexts += sc
     var manager = sc.executorAllocationManager.get
@@ -202,7 +200,7 @@ class ExecutorAllocationManagerSuite
     // Verify that running a task doesn't affect the target
     post(sc.listenerBus, SparkListenerStageSubmitted(createStageInfo(1, 3)))
     post(sc.listenerBus, SparkListenerExecutorAdded(
-      0L, "executor-1", new ExecutorInfo("host1", 1, Map.empty, Map.empty)))
+      0L, "executor-1", new ExecutorInfo("host1", 1, Map.empty)))
     post(sc.listenerBus, SparkListenerTaskStart(1, 0, createTaskInfo(0, 0, "executor-1")))
     assert(numExecutorsTarget(manager) === 5)
     assert(addExecutors(manager) === 1)
@@ -422,6 +420,7 @@ class ExecutorAllocationManagerSuite
     // Remove when numExecutorsTarget is the same as the current number of executors
     assert(addExecutors(manager) === 1)
     assert(addExecutors(manager) === 2)
+    (1 to 8).foreach(execId => onExecutorAdded(manager, execId.toString))
     (1 to 8).map { i => createTaskInfo(i, i, s"$i") }.foreach {
       info => post(sc.listenerBus, SparkListenerTaskStart(0, 0, info)) }
     assert(executorIds(manager).size === 8)
@@ -602,68 +601,6 @@ class ExecutorAllocationManagerSuite
     assert(removeTimes(manager)("1") === secondRemoveTime) // timer is already started
     assert(removeTimes(manager)("1") !== firstRemoveTime)
     assert(firstRemoveTime !== secondRemoveTime)
-  }
-
-  test("starting remove timers with cached/shuffle data") {
-    val minExecutors = 1
-    val initialExecutors = 1
-    val maxExecutors = 2
-    val conf = new SparkConf()
-      .set("spark.dynamicAllocation.enabled", "true")
-      .set("spark.dynamicAllocation.minExecutors", minExecutors.toString)
-      .set("spark.dynamicAllocation.maxExecutors", maxExecutors.toString)
-      .set("spark.dynamicAllocation.initialExecutors", initialExecutors.toString)
-      .set("spark.dynamicAllocation.schedulerBacklogTimeout", "1000ms")
-      .set("spark.dynamicAllocation.sustainedSchedulerBacklogTimeout", "1000ms")
-      .set("spark.dynamicAllocation.executorIdleTimeout", s"${executorIdleTimeout}s")
-      .set("spark.dynamicAllocation.cachedExecutorIdleTimeout", s"${cachedExecutorIdleTimeout}s")
-      .set("spark.dynamicAllocation.inactiveShuffleExecutorIdleTimeout",
-          s"${inactiveShuffleExecutorIdleTimeout}s")
-    val mockAllocationClient = mock(classOf[ExecutorAllocationClient])
-    val mockMOTM = mock(classOf[MapOutputTrackerMaster])
-    val mockBMM = mock(classOf[BlockManagerMaster])
-    val manager = new ExecutorAllocationManager(
-      mockAllocationClient, mock(classOf[LiveListenerBus]), conf, mockMOTM, mockBMM)
-    val clock = new ManualClock()
-    manager.setClock(clock)
-
-    // 1. No cache or shuffle data => gets normal timeout.
-    when(mockBMM.hasCachedBlocks("executor-1")).thenReturn(false)
-    when(mockMOTM.hasOutputsOnExecutor("executor-1")).thenReturn(false)
-    when(mockMOTM.hasOutputsOnExecutor("executor-1", activeOnly = true)).thenReturn(false)
-    onExecutorAdded(manager, "executor-1")
-    onExecutorIdle(manager, "executor-1")
-    assert(removeTimes(manager).contains("executor-1"))
-    assert(removeTimes(manager)("executor-1") ===
-      clock.getTimeMillis() + executorIdleTimeout * 1000)
-
-    // 2. Cached data => gets cached executor timeout.
-    when(mockBMM.hasCachedBlocks("executor-2")).thenReturn(true)
-    when(mockMOTM.hasOutputsOnExecutor("executor-2")).thenReturn(false)
-    when(mockMOTM.hasOutputsOnExecutor("executor-2", activeOnly = true)).thenReturn(false)
-    onExecutorAdded(manager, "executor-2")
-    onExecutorIdle(manager, "executor-2")
-    assert(removeTimes(manager).contains("executor-2"))
-    assert(removeTimes(manager)("executor-2") ===
-      clock.getTimeMillis() + cachedExecutorIdleTimeout * 1000)
-
-    // 3. Inactive shuffle data => gets inactive shuffle executor timeout.
-    when(mockBMM.hasCachedBlocks("executor-3")).thenReturn(false)
-    when(mockMOTM.hasOutputsOnExecutor("executor-3")).thenReturn(true)
-    when(mockMOTM.hasOutputsOnExecutor("executor-3", activeOnly = true)).thenReturn(false)
-    onExecutorAdded(manager, "executor-3")
-    onExecutorIdle(manager, "executor-3")
-    assert(removeTimes(manager).contains("executor-3"))
-    assert(removeTimes(manager)("executor-3") ===
-      clock.getTimeMillis() + inactiveShuffleExecutorIdleTimeout * 1000)
-
-    // 4. Active shuffle data => not scheduled for removal.
-    when(mockBMM.hasCachedBlocks("executor-4")).thenReturn(false)
-    when(mockMOTM.hasOutputsOnExecutor("executor-4")).thenReturn(true)
-    when(mockMOTM.hasOutputsOnExecutor("executor-4", activeOnly = true)).thenReturn(true)
-    onExecutorAdded(manager, "executor-4")
-    onExecutorIdle(manager, "executor-4")
-    assert(!removeTimes(manager).contains("executor-4"))
   }
 
   test("mock polling loop with no events") {
@@ -872,13 +809,13 @@ class ExecutorAllocationManagerSuite
 
     // New executors have registered
     post(sc.listenerBus, SparkListenerExecutorAdded(
-      0L, "executor-1", new ExecutorInfo("host1", 1, Map.empty, Map.empty)))
+      0L, "executor-1", new ExecutorInfo("host1", 1, Map.empty)))
     assert(executorIds(manager).size === 1)
     assert(executorIds(manager).contains("executor-1"))
     assert(removeTimes(manager).size === 1)
     assert(removeTimes(manager).contains("executor-1"))
     post(sc.listenerBus, SparkListenerExecutorAdded(
-      0L, "executor-2", new ExecutorInfo("host2", 1, Map.empty, Map.empty)))
+      0L, "executor-2", new ExecutorInfo("host2", 1, Map.empty)))
     assert(executorIds(manager).size === 2)
     assert(executorIds(manager).contains("executor-2"))
     assert(removeTimes(manager).size === 2)
@@ -897,7 +834,7 @@ class ExecutorAllocationManagerSuite
     assert(removeTimes(manager).size === 1)
   }
 
-  test("SPARK-4951: call onTaskStart before onBlockManagerAdded") {
+  test("SPARK-4951: call onTaskStart before onExecutorAdded") {
     sc = createSparkContext(2, 10, 2)
     val manager = sc.executorAllocationManager.get
     assert(executorIds(manager).isEmpty)
@@ -905,7 +842,7 @@ class ExecutorAllocationManagerSuite
 
     post(sc.listenerBus, SparkListenerTaskStart(0, 0, createTaskInfo(0, 0, "executor-1")))
     post(sc.listenerBus, SparkListenerExecutorAdded(
-      0L, "executor-1", new ExecutorInfo("host1", 1, Map.empty, Map.empty)))
+      0L, "executor-1", new ExecutorInfo("host1", 1, Map.empty)))
     assert(executorIds(manager).size === 1)
     assert(executorIds(manager).contains("executor-1"))
     assert(removeTimes(manager).size === 0)
@@ -917,7 +854,7 @@ class ExecutorAllocationManagerSuite
     assert(executorIds(manager).isEmpty)
     assert(removeTimes(manager).isEmpty)
     post(sc.listenerBus, SparkListenerExecutorAdded(
-      0L, "executor-1", new ExecutorInfo("host1", 1, Map.empty, Map.empty)))
+      0L, "executor-1", new ExecutorInfo("host1", 1, Map.empty)))
     post(sc.listenerBus, SparkListenerTaskStart(0, 0, createTaskInfo(0, 0, "executor-1")))
 
     assert(executorIds(manager).size === 1)
@@ -925,7 +862,7 @@ class ExecutorAllocationManagerSuite
     assert(removeTimes(manager).size === 0)
 
     post(sc.listenerBus, SparkListenerExecutorAdded(
-      0L, "executor-2", new ExecutorInfo("host1", 1, Map.empty, Map.empty)))
+      0L, "executor-2", new ExecutorInfo("host1", 1, Map.empty)))
     assert(executorIds(manager).size === 2)
     assert(executorIds(manager).contains("executor-2"))
     assert(removeTimes(manager).size === 1)
@@ -999,12 +936,7 @@ class ExecutorAllocationManagerSuite
 
     assert(maxNumExecutorsNeeded(manager) === 0)
     schedule(manager)
-    // Verify executor is timeout but numExecutorsTarget is not recalculated
-    assert(numExecutorsTarget(manager) === 3)
-
-    // Schedule again to recalculate the numExecutorsTarget after executor is timeout
-    schedule(manager)
-    // Verify that current number of executors should be ramp down when executor is timeout
+    // Verify executor is timeout,numExecutorsTarget is recalculated
     assert(numExecutorsTarget(manager) === 2)
   }
 
@@ -1156,27 +1088,26 @@ class ExecutorAllocationManagerSuite
     val initialExecutors = 1
     val maxExecutors = 2
     val conf = new SparkConf()
-      .set(config.DYN_ALLOCATION_ENABLED, true)
-      .set(config.SHUFFLE_SERVICE_ENABLED, true)
-      .set(config.DYN_ALLOCATION_MIN_EXECUTORS, minExecutors)
-      .set(config.DYN_ALLOCATION_MAX_EXECUTORS, maxExecutors)
-      .set(config.DYN_ALLOCATION_INITIAL_EXECUTORS, initialExecutors)
-      .set(config.DYN_ALLOCATION_SCHEDULER_BACKLOG_TIMEOUT.key, "1000ms")
-      .set(config.DYN_ALLOCATION_SUSTAINED_SCHEDULER_BACKLOG_TIMEOUT.key, "1000ms")
-      .set(config.DYN_ALLOCATION_EXECUTOR_IDLE_TIMEOUT.key, "3000ms")
+      .set("spark.dynamicAllocation.enabled", "true")
+      .set(config.SHUFFLE_SERVICE_ENABLED.key, "true")
+      .set("spark.dynamicAllocation.minExecutors", minExecutors.toString)
+      .set("spark.dynamicAllocation.maxExecutors", maxExecutors.toString)
+      .set("spark.dynamicAllocation.initialExecutors", initialExecutors.toString)
+      .set("spark.dynamicAllocation.schedulerBacklogTimeout", "1000ms")
+      .set("spark.dynamicAllocation.sustainedSchedulerBacklogTimeout", "1000ms")
+      .set("spark.dynamicAllocation.executorIdleTimeout", s"3000ms")
     val mockAllocationClient = mock(classOf[ExecutorAllocationClient])
-    val mockMOTM = mock(classOf[MapOutputTrackerMaster])
     val mockBMM = mock(classOf[BlockManagerMaster])
     val manager = new ExecutorAllocationManager(
-      mockAllocationClient, mock(classOf[LiveListenerBus]), conf, mockMOTM, mockBMM)
+      mockAllocationClient, mock(classOf[LiveListenerBus]), conf, mockBMM)
     val clock = new ManualClock()
     manager.setClock(clock)
 
-   // when(mockAllocationClient.requestTotalExecutors(meq(2), any(), any())).thenReturn(true)
+    when(mockAllocationClient.requestTotalExecutors(meq(2), any(), any())).thenReturn(true)
     // test setup -- job with 2 tasks, scale up to two executors
     assert(numExecutorsTarget(manager) === 1)
     manager.listener.onExecutorAdded(SparkListenerExecutorAdded(
-      clock.getTimeMillis(), "executor-1", new ExecutorInfo("host1", 1, Map.empty, Map.empty)))
+      clock.getTimeMillis(), "executor-1", new ExecutorInfo("host1", 1, Map.empty)))
     manager.listener.onStageSubmitted(SparkListenerStageSubmitted(createStageInfo(0, 2)))
     clock.advance(1000)
     manager invokePrivate _updateAndSyncNumExecutorsTarget(clock.getTimeMillis())
@@ -1184,7 +1115,7 @@ class ExecutorAllocationManagerSuite
     val taskInfo0 = createTaskInfo(0, 0, "executor-1")
     manager.listener.onTaskStart(SparkListenerTaskStart(0, 0, taskInfo0))
     manager.listener.onExecutorAdded(SparkListenerExecutorAdded(
-      clock.getTimeMillis(), "executor-2", new ExecutorInfo("host1", 1, Map.empty, Map.empty)))
+      clock.getTimeMillis(), "executor-2", new ExecutorInfo("host1", 1, Map.empty)))
     val taskInfo1 = createTaskInfo(1, 1, "executor-2")
     manager.listener.onTaskStart(SparkListenerTaskStart(0, 0, taskInfo1))
     assert(numExecutorsTarget(manager) === 2)
@@ -1197,8 +1128,7 @@ class ExecutorAllocationManagerSuite
     clock.advance(1000)
     manager invokePrivate _updateAndSyncNumExecutorsTarget(clock.getTimeMillis())
     assert(numExecutorsTarget(manager) === 1)
-
-    // verify(mockAllocationClient, never).killExecutors(any(), any(), any(), any())
+    verify(mockAllocationClient, never).killExecutors(any(), any(), any(), any())
 
     // now we cross the idle timeout for executor-1, so we kill it.  the really important
     // thing here is that we do *not* ask the executor allocation client to adjust the target
@@ -1213,6 +1143,48 @@ class ExecutorAllocationManagerSuite
     verify(mockAllocationClient).killExecutors(Seq("executor-1"), false, false, false)
   }
 
+  test("SPARK-26758 check executor target number after idle time out ") {
+    sc = createSparkContext(1, 5, 3)
+    val manager = sc.executorAllocationManager.get
+    val clock = new ManualClock(10000L)
+    manager.setClock(clock)
+    assert(numExecutorsTarget(manager) === 3)
+    manager.listener.onExecutorAdded(SparkListenerExecutorAdded(
+      clock.getTimeMillis(), "executor-1", new ExecutorInfo("host1", 1, Map.empty)))
+    manager.listener.onExecutorAdded(SparkListenerExecutorAdded(
+      clock.getTimeMillis(), "executor-2", new ExecutorInfo("host1", 2, Map.empty)))
+    manager.listener.onExecutorAdded(SparkListenerExecutorAdded(
+      clock.getTimeMillis(), "executor-3", new ExecutorInfo("host1", 3, Map.empty)))
+    // make all the executors as idle, so that it will be killed
+    clock.advance(executorIdleTimeout * 1000)
+    schedule(manager)
+    // once the schedule is run target executor number should be 1
+    assert(numExecutorsTarget(manager) === 1)
+  }
+
+  test("SPARK-26927 call onExecutorRemoved before onTaskStart") {
+    sc = createSparkContext(2, 5)
+    val manager = sc.executorAllocationManager.get
+    assert(executorIds(manager).isEmpty)
+    post(sc.listenerBus, SparkListenerExecutorAdded(
+      0L, "1", new ExecutorInfo("host1", 1, Map.empty)))
+    post(sc.listenerBus, SparkListenerExecutorAdded(
+      0L, "2", new ExecutorInfo("host2", 1, Map.empty)))
+    post(sc.listenerBus, SparkListenerExecutorAdded(
+      0L, "3", new ExecutorInfo("host3", 1, Map.empty)))
+    assert(executorIds(manager).size === 3)
+
+    post(sc.listenerBus, SparkListenerExecutorRemoved(0L, "3", "disconnected"))
+    assert(executorIds(manager).size === 2)
+    assert(executorIds(manager) === Set("1", "2"))
+
+    val taskInfo1 = createTaskInfo(0, 0, "3")
+    post(sc.listenerBus, SparkListenerTaskStart(0, 0, taskInfo1))
+    // Verify taskStart not adding already removed executors.
+    assert(executorIds(manager).size === 2)
+    assert(executorIds(manager) === Set("1", "2"))
+  }
+
   private def createSparkContext(
       minExecutors: Int = 1,
       maxExecutors: Int = 5,
@@ -1220,21 +1192,19 @@ class ExecutorAllocationManagerSuite
     val conf = new SparkConf()
       .setMaster("myDummyLocalExternalClusterManager")
       .setAppName("test-executor-allocation-manager")
-      .set(config.DYN_ALLOCATION_ENABLED, true)
-      .set(config.DYN_ALLOCATION_MIN_EXECUTORS, minExecutors)
-      .set(config.DYN_ALLOCATION_MAX_EXECUTORS, maxExecutors)
-      .set(config.DYN_ALLOCATION_INITIAL_EXECUTORS, initialExecutors)
-      .set(config.DYN_ALLOCATION_SCHEDULER_BACKLOG_TIMEOUT.key,
-        s"${schedulerBacklogTimeout.toString}s")
-      .set(config.DYN_ALLOCATION_SUSTAINED_SCHEDULER_BACKLOG_TIMEOUT.key,
+      .set("spark.dynamicAllocation.enabled", "true")
+      .set("spark.dynamicAllocation.minExecutors", minExecutors.toString)
+      .set("spark.dynamicAllocation.maxExecutors", maxExecutors.toString)
+      .set("spark.dynamicAllocation.initialExecutors", initialExecutors.toString)
+      .set("spark.dynamicAllocation.schedulerBacklogTimeout",
+          s"${schedulerBacklogTimeout.toString}s")
+      .set("spark.dynamicAllocation.sustainedSchedulerBacklogTimeout",
         s"${sustainedSchedulerBacklogTimeout.toString}s")
-      .set(config.DYN_ALLOCATION_EXECUTOR_IDLE_TIMEOUT.key, s"${executorIdleTimeout.toString}s")
-      .set(config.DYN_ALLOCATION_TESTING, true)
-      .set(config.DYN_ALLOCATION_CACHED_EXECUTOR_IDLE_TIMEOUT.key,
-          s"${cachedExecutorIdleTimeout.toString}s")
+      .set("spark.dynamicAllocation.executorIdleTimeout", s"${executorIdleTimeout.toString}s")
+      .set("spark.dynamicAllocation.testing", "true")
       // SPARK-22864: effectively disable the allocation schedule by setting the period to a
       // really long value.
-      .set(TEST_SCHEDULE_INTERVAL, 10000L)
+      .set(TESTING_SCHEDULE_INTERVAL_KEY, "10000")
     val sc = new SparkContext(conf)
     contexts += sc
     sc
@@ -1250,8 +1220,6 @@ private object ExecutorAllocationManagerSuite extends PrivateMethodTester {
   private val schedulerBacklogTimeout = 1L
   private val sustainedSchedulerBacklogTimeout = 2L
   private val executorIdleTimeout = 3L
-  private val cachedExecutorIdleTimeout = 4L
-  private val inactiveShuffleExecutorIdleTimeout = 5L
 
   private def createStageInfo(
       stageId: Int,

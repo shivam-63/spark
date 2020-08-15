@@ -31,8 +31,7 @@ import scala.util.Try
 
 import org.apache.spark.{SparkException, SparkUserAppException}
 import org.apache.spark.deploy.SparkSubmitAction._
-import org.apache.spark.internal.{config, Logging}
-import org.apache.spark.internal.config.DYN_ALLOCATION_ENABLED
+import org.apache.spark.internal.Logging
 import org.apache.spark.launcher.SparkSubmitArgumentsParser
 import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.util.Utils
@@ -47,6 +46,7 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
   var deployMode: String = null
   var executorMemory: String = null
   var executorCores: String = null
+  var executorGPUs: String = null
   var totalExecutorCores: String = null
   var propertiesFile: String = null
   var driverMemory: String = null
@@ -71,6 +71,8 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
   var isPython: Boolean = false
   var pyFiles: String = null
   var isR: Boolean = false
+  var isTensorFlow: String = null
+  var tensorflowNumPs: String = null
   var action: SparkSubmitAction = null
   val sparkProperties: HashMap[String, String] = new HashMap[String, String]()
   var proxyUser: String = null
@@ -156,31 +158,35 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
       .orElse(env.get("MASTER"))
       .orNull
     driverExtraClassPath = Option(driverExtraClassPath)
-      .orElse(sparkProperties.get(config.DRIVER_CLASS_PATH.key))
+      .orElse(sparkProperties.get("spark.driver.extraClassPath"))
       .orNull
     driverExtraJavaOptions = Option(driverExtraJavaOptions)
-      .orElse(sparkProperties.get(config.DRIVER_JAVA_OPTIONS.key))
+      .orElse(sparkProperties.get("spark.driver.extraJavaOptions"))
       .orNull
     driverExtraLibraryPath = Option(driverExtraLibraryPath)
-      .orElse(sparkProperties.get(config.DRIVER_LIBRARY_PATH.key))
+      .orElse(sparkProperties.get("spark.driver.extraLibraryPath"))
       .orNull
     driverMemory = Option(driverMemory)
-      .orElse(sparkProperties.get(config.DRIVER_MEMORY.key))
+      .orElse(sparkProperties.get("spark.driver.memory"))
       .orElse(env.get("SPARK_DRIVER_MEMORY"))
       .orNull
     driverCores = Option(driverCores)
-      .orElse(sparkProperties.get(config.DRIVER_CORES.key))
+      .orElse(sparkProperties.get("spark.driver.cores"))
       .orNull
     executorMemory = Option(executorMemory)
-      .orElse(sparkProperties.get(config.EXECUTOR_MEMORY.key))
+      .orElse(sparkProperties.get("spark.executor.memory"))
       .orElse(env.get("SPARK_EXECUTOR_MEMORY"))
       .orNull
     executorCores = Option(executorCores)
-      .orElse(sparkProperties.get(config.EXECUTOR_CORES.key))
+      .orElse(sparkProperties.get("spark.executor.cores"))
       .orElse(env.get("SPARK_EXECUTOR_CORES"))
       .orNull
     totalExecutorCores = Option(totalExecutorCores)
-      .orElse(sparkProperties.get(config.CORES_MAX.key))
+      .orElse(sparkProperties.get("spark.cores.max"))
+      .orNull
+    executorGPUs = Option(executorGPUs)
+      .orElse(sparkProperties.get("spark.executor.gpus"))
+      .orElse(env.get("SPARK_EXECUTOR_GPUS"))
       .orNull
     name = Option(name).orElse(sparkProperties.get("spark.app.name")).orNull
     jars = Option(jars).orElse(sparkProperties.get("spark.jars")).orNull
@@ -198,18 +204,20 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
       .orElse(env.get("DEPLOY_MODE"))
       .orNull
     numExecutors = Option(numExecutors)
-      .getOrElse(sparkProperties.get(config.EXECUTOR_INSTANCES.key).orNull)
+      .getOrElse(sparkProperties.get("spark.executor.instances").orNull)
+    isTensorFlow = Option(isTensorFlow)
+      .orElse(sparkProperties.get("spark.tensorflow.application"))
+      .orElse(env.get("SPARK_TENSORFLOW_APPLICATION"))
+      .getOrElse("false")
+    tensorflowNumPs = Option(tensorflowNumPs)
+      .orElse(sparkProperties.get("spark.tensorflow.num.ps"))
+      .orElse(env.get("SPARK_TENSORFLOW_NUM_PS"))
+      .getOrElse("0")
     queue = Option(queue).orElse(sparkProperties.get("spark.yarn.queue")).orNull
-    keytab = Option(keytab)
-      .orElse(sparkProperties.get("spark.kerberos.keytab"))
-      .orElse(sparkProperties.get("spark.yarn.keytab"))
-      .orNull
-    principal = Option(principal)
-      .orElse(sparkProperties.get("spark.kerberos.principal"))
-      .orElse(sparkProperties.get("spark.yarn.principal"))
-      .orNull
+    keytab = Option(keytab).orElse(sparkProperties.get("spark.yarn.keytab")).orNull
+    principal = Option(principal).orElse(sparkProperties.get("spark.yarn.principal")).orNull
     dynamicAllocationEnabled =
-      sparkProperties.get(DYN_ALLOCATION_ENABLED.key).exists("true".equalsIgnoreCase)
+      sparkProperties.get("spark.dynamicAllocation.enabled").exists("true".equalsIgnoreCase)
 
     // Try to set main class from JAR if no --class argument is given
     if (mainClass == null && !isPython && !isR && primaryResource != null) {
@@ -293,11 +301,9 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
 
     if (master.startsWith("yarn")) {
       val hasHadoopEnv = env.contains("HADOOP_CONF_DIR") || env.contains("YARN_CONF_DIR")
-      val hasHadoopProp = sparkProperties.contains("spark.yarn.conf.dir")
-      if (!hasHadoopEnv && !hasHadoopProp && !Utils.isTesting) {
+      if (!hasHadoopEnv && !Utils.isTesting) {
         error(s"When running with master '$master' " +
-          "either HADOOP_CONF_DIR or YARN_CONF_DIR must be set in the environment, +" +
-          "or spark.yarn.conf.dir in the spark properties.")
+          "either HADOOP_CONF_DIR or YARN_CONF_DIR must be set in the environment.")
       }
     }
 
@@ -335,6 +341,7 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
     |  deployMode              $deployMode
     |  executorMemory          $executorMemory
     |  executorCores           $executorCores
+    |  executorGPUs            $executorGPUs
     |  totalExecutorCores      $totalExecutorCores
     |  propertiesFile          $propertiesFile
     |  driverMemory            $driverMemory
@@ -344,6 +351,8 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
     |  driverExtraJavaOptions  $driverExtraJavaOptions
     |  supervise               $supervise
     |  queue                   $queue
+    |  isTensorFlow            $isTensorFlow
+    |  tensorflowNumPs         $tensorflowNumPs
     |  numExecutors            $numExecutors
     |  files                   $files
     |  pyFiles                 $pyFiles
@@ -388,6 +397,9 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
       case TOTAL_EXECUTOR_CORES =>
         totalExecutorCores = value
 
+      case EXECUTOR_GPUS =>
+        executorGPUs = value
+
       case EXECUTOR_CORES =>
         executorCores = value
 
@@ -431,6 +443,12 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
 
       case QUEUE =>
         queue = value
+
+      case IS_TENSORFLOW =>
+        isTensorFlow = value
+
+      case NUM_TENSORFLOW_PS =>
+        tensorflowNumPs = value
 
       case FILES =>
         files = Utils.resolveURIs(value)
@@ -579,26 +597,27 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
         |  --kill SUBMISSION_ID        If given, kills the driver specified.
         |  --status SUBMISSION_ID      If given, requests the status of the driver specified.
         |
-        | Spark standalone, Mesos and Kubernetes only:
+        | Spark standalone and Mesos only:
         |  --total-executor-cores NUM  Total cores for all executors.
         |
-        | Spark standalone, YARN and Kubernetes only:
-        |  --executor-cores NUM        Number of cores used by each executor. (Default: 1 in
-        |                              YARN and K8S modes, or all available cores on the worker
-        |                              in standalone mode).
+        | Spark standalone and YARN only:
+        |  --executor-cores NUM        Number of cores per executor. (Default: 1 in YARN mode,
+        |                              or all available cores on the worker in standalone mode)
         |
-        | Spark on YARN and Kubernetes only:
+        | YARN-only:
+        |  --queue QUEUE_NAME          The YARN queue to submit to (Default: "default").
         |  --num-executors NUM         Number of executors to launch (Default: 2).
         |                              If dynamic allocation is enabled, the initial number of
         |                              executors will be at least NUM.
-        |  --principal PRINCIPAL       Principal to be used to login to KDC.
-        |  --keytab KEYTAB             The full path to the file that contains the keytab for the
-        |                              principal specified above.
-        |
-        | Spark on YARN only:
-        |  --queue QUEUE_NAME          The YARN queue to submit to (Default: "default").
         |  --archives ARCHIVES         Comma separated list of archives to be extracted into the
         |                              working directory of each executor.
+        |  --principal PRINCIPAL       Principal to be used to login to KDC, while running on
+        |                              secure HDFS.
+        |  --keytab KEYTAB             The full path to the file that contains the keytab for the
+        |                              principal specified above. This keytab will be copied to
+        |                              the node running the Application Master via the Secure
+        |                              Distributed Cache, for renewing the login tickets and the
+        |                              delegation tokens periodically.
       """.stripMargin
     )
 

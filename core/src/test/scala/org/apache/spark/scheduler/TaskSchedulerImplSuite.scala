@@ -22,17 +22,15 @@ import java.nio.ByteBuffer
 import scala.collection.mutable.HashMap
 import scala.concurrent.duration._
 
-import org.mockito.ArgumentMatchers.{any, anyInt, anyString, eq => meq}
+import org.mockito.Matchers.{anyInt, anyObject, anyString, eq => meq}
 import org.mockito.Mockito.{atLeast, atMost, never, spy, times, verify, when}
 import org.scalatest.BeforeAndAfterEach
 import org.scalatest.concurrent.Eventually
 import org.scalatest.mockito.MockitoSugar
 
 import org.apache.spark._
-import org.apache.spark.ExecutorShuffleStatus._
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config
-import org.apache.spark.storage.BlockManagerId
 import org.apache.spark.util.ManualClock
 
 class FakeSchedulerBackend extends SchedulerBackend {
@@ -94,7 +92,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext with B
 
     sc = new SparkContext(conf)
     taskScheduler =
-      new TaskSchedulerImpl(sc, sc.conf.get(config.TASK_MAX_FAILURES)) {
+      new TaskSchedulerImpl(sc, sc.conf.getInt("spark.task.maxFailures", 4)) {
         override def createTaskSetManager(taskSet: TaskSet, maxFailures: Int): TaskSetManager = {
           val tsm = super.createTaskSetManager(taskSet, maxFailures)
           // we need to create a spied tsm just so we can set the TaskSetBlacklist
@@ -157,7 +155,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext with B
 
   test("Scheduler correctly accounts for multiple CPUs per task") {
     val taskCpus = 2
-    val taskScheduler = setupScheduler(config.CPUS_PER_TASK.key -> taskCpus.toString)
+    val taskScheduler = setupScheduler("spark.task.cpus" -> taskCpus.toString)
     // Give zero core offers. Should not generate any tasks
     val zeroCoreWorkerOffers = IndexedSeq(new WorkerOffer("executor0", "host0", 0),
       new WorkerOffer("executor1", "host1", 0))
@@ -187,7 +185,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext with B
 
   test("Scheduler does not crash when tasks are not serializable") {
     val taskCpus = 2
-    val taskScheduler = setupScheduler(config.CPUS_PER_TASK.key -> taskCpus.toString)
+    val taskScheduler = setupScheduler("spark.task.cpus" -> taskCpus.toString)
     val numFreeCores = 1
     val taskSet = new TaskSet(
       Array(new NotSerializableFakeTask(1, 0), new NotSerializableFakeTask(0, 1)), 0, 0, 0, null)
@@ -203,28 +201,39 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext with B
     // Even if one of the task sets has not-serializable tasks, the other task set should
     // still be processed without error
     taskScheduler.submitTasks(FakeTask.createTaskSet(1))
-    taskScheduler.submitTasks(taskSet)
+    val taskSet2 = new TaskSet(
+      Array(new NotSerializableFakeTask(1, 0), new NotSerializableFakeTask(0, 1)), 1, 0, 0, null)
+    taskScheduler.submitTasks(taskSet2)
     taskDescriptions = taskScheduler.resourceOffers(multiCoreWorkerOffers).flatten
     assert(taskDescriptions.map(_.executorId) === Seq("executor0"))
   }
 
-  test("refuse to schedule concurrent attempts for the same stage (SPARK-8103)") {
+  test("concurrent attempts for the same stage only have one active taskset") {
     val taskScheduler = setupScheduler()
-    val attempt1 = FakeTask.createTaskSet(1, 0)
-    val attempt2 = FakeTask.createTaskSet(1, 1)
-    taskScheduler.submitTasks(attempt1)
-    intercept[IllegalStateException] { taskScheduler.submitTasks(attempt2) }
+    def isTasksetZombie(taskset: TaskSet): Boolean = {
+      taskScheduler.taskSetManagerForAttempt(taskset.stageId, taskset.stageAttemptId).get.isZombie
+    }
 
-    // OK to submit multiple if previous attempts are all zombie
-    taskScheduler.taskSetManagerForAttempt(attempt1.stageId, attempt1.stageAttemptId)
-      .get.isZombie = true
+    val attempt1 = FakeTask.createTaskSet(1, 0)
+    taskScheduler.submitTasks(attempt1)
+    // The first submitted taskset is active
+    assert(!isTasksetZombie(attempt1))
+
+    val attempt2 = FakeTask.createTaskSet(1, 1)
     taskScheduler.submitTasks(attempt2)
+    // The first submitted taskset is zombie now
+    assert(isTasksetZombie(attempt1))
+    // The newly submitted taskset is active
+    assert(!isTasksetZombie(attempt2))
+
     val attempt3 = FakeTask.createTaskSet(1, 2)
-    intercept[IllegalStateException] { taskScheduler.submitTasks(attempt3) }
-    taskScheduler.taskSetManagerForAttempt(attempt2.stageId, attempt2.stageAttemptId)
-      .get.isZombie = true
     taskScheduler.submitTasks(attempt3)
-    assert(!failedTaskSet)
+    // The first submitted taskset remains zombie
+    assert(isTasksetZombie(attempt1))
+    // The second submitted taskset is zombie now
+    assert(isTasksetZombie(attempt2))
+    // The newly submitted taskset is active
+    assert(!isTasksetZombie(attempt3))
   }
 
   test("don't schedule more tasks after a taskset is zombie") {
@@ -432,7 +441,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext with B
     verify(blacklist, never).updateBlacklistForSuccessfulTaskSet(
       stageId = meq(2),
       stageAttemptId = anyInt(),
-      failuresByExec = any())
+      failuresByExec = anyObject())
   }
 
   test("scheduled tasks obey node and executor blacklists") {
@@ -506,7 +515,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext with B
       WorkerOffer("executor3", "host1", 2)
     )).flatten.size === 0)
     assert(tsm.isZombie)
-    verify(tsm).abort(anyString(), any())
+    verify(tsm).abort(anyString(), anyObject())
   }
 
   test("SPARK-22148 abort timer should kick in when task is completely blacklisted & no new " +
@@ -1013,7 +1022,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext with B
 
   test("Locality should be used for bulk offers even with delay scheduling off") {
     val conf = new SparkConf()
-      .set(config.LOCALITY_WAIT.key, "0")
+      .set("spark.locality.wait", "0")
     sc = new SparkContext("local", "TaskSchedulerImplSuite", conf)
     // we create a manual clock just so we can be sure the clock doesn't advance at all in this test
     val clock = new ManualClock()
@@ -1021,7 +1030,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext with B
     // We customize the task scheduler just to let us control the way offers are shuffled, so we
     // can be sure we try both permutations, and to control the clock on the tasksetmanager.
     val taskScheduler = new TaskSchedulerImpl(sc) {
-      override def doShuffleOffers(offers: IndexedSeq[WorkerOffer]): IndexedSeq[WorkerOffer] = {
+      override def shuffleOffers(offers: IndexedSeq[WorkerOffer]): IndexedSeq[WorkerOffer] = {
         // Don't shuffle the offers around for this test.  Instead, we'll just pass in all
         // the permutations we care about directly.
         offers
@@ -1058,43 +1067,9 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext with B
     }
   }
 
-  test("Shuffle-biased task scheduling enabled should lead to non-random offer shuffling") {
-    setupScheduler("spark.scheduler.shuffleBiasedTaskScheduling.enabled" -> "true")
-
-    // Make offers in different executors, so they can be a mix of active, inactive, unknown
-    val offers = IndexedSeq(
-      WorkerOffer("exec1", "host1", 2), // inactive
-      WorkerOffer("exec2", "host2", 2), // active
-      WorkerOffer("exec3", "host3", 2) // unknown
-    )
-    val makeMapStatus = (offer: WorkerOffer) =>
-      MapStatus(BlockManagerId(offer.executorId, offer.host, 1), Array(10), 0L)
-    val mapOutputTracker = sc.env.mapOutputTracker.asInstanceOf[MapOutputTrackerMaster]
-    mapOutputTracker.registerShuffle(0, 2)
-    mapOutputTracker.registerShuffle(1, 1)
-    mapOutputTracker.registerMapOutput(0, 0, makeMapStatus(offers(0)))
-    mapOutputTracker.registerMapOutput(0, 1, makeMapStatus(offers(1)))
-    mapOutputTracker.registerMapOutput(1, 0, makeMapStatus(offers(1)))
-    mapOutputTracker.markShuffleInactive(0)
-
-    val execStatus = mapOutputTracker.getExecutorShuffleStatus
-    assert(execStatus.equals(Map("exec1" -> Inactive, "exec2" -> Active)))
-
-    assert(taskScheduler.partitionAndShuffleOffers(offers).map(_._1)
-      .equals(IndexedSeq(Active, Inactive, Unknown)))
-    assert(taskScheduler.partitionAndShuffleOffers(offers).flatMap(_._2).map(offers.indexOf(_))
-      .equals(IndexedSeq(1, 0, 2)))
-
-    taskScheduler.submitTasks(FakeTask.createTaskSet(3, stageId = 1, stageAttemptId = 0))
-    // should go to active first, then inactive
-    val taskDescs = taskScheduler.resourceOffers(offers).flatten
-    assert(taskDescs.size === 3)
-    assert(taskDescs.map(_.executorId).equals(Seq("exec2", "exec2", "exec1")))
-  }
-
   test("With delay scheduling off, tasks can be run at any locality level immediately") {
     val conf = new SparkConf()
-      .set(config.LOCALITY_WAIT.key, "0")
+      .set("spark.locality.wait", "0")
     sc = new SparkContext("local", "TaskSchedulerImplSuite", conf)
 
     // we create a manual clock just so we can be sure the clock doesn't advance at all in this test
@@ -1220,7 +1195,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext with B
     assert(finalTsm.isZombie)
 
     // no taskset has completed all of its tasks, so no updates to the blacklist tracker yet
-    verify(blacklist, never).updateBlacklistForSuccessfulTaskSet(anyInt(), anyInt(), any())
+    verify(blacklist, never).updateBlacklistForSuccessfulTaskSet(anyInt(), anyInt(), anyObject())
 
     // finally, lets complete all the tasks.  We simulate failures in attempt 1, but everything
     // else succeeds, to make sure we get the right updates to the blacklist in all cases.
@@ -1238,13 +1213,13 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext with B
       // we update the blacklist for the stage attempts with all successful tasks.  Even though
       // some tasksets had failures, we still consider them all successful from a blacklisting
       // perspective, as the failures weren't from a problem w/ the tasks themselves.
-      verify(blacklist).updateBlacklistForSuccessfulTaskSet(meq(0), meq(stageAttempt), any())
+      verify(blacklist).updateBlacklistForSuccessfulTaskSet(meq(0), meq(stageAttempt), anyObject())
     }
   }
 
   test("don't schedule for a barrier taskSet if available slots are less than pending tasks") {
     val taskCpus = 2
-    val taskScheduler = setupScheduler(config.CPUS_PER_TASK.key -> taskCpus.toString)
+    val taskScheduler = setupScheduler("spark.task.cpus" -> taskCpus.toString)
 
     val numFreeCores = 3
     val workerOffers = IndexedSeq(
@@ -1261,7 +1236,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext with B
 
   test("schedule tasks for a barrier taskSet if all tasks can be launched together") {
     val taskCpus = 2
-    val taskScheduler = setupScheduler(config.CPUS_PER_TASK.key -> taskCpus.toString)
+    val taskScheduler = setupScheduler("spark.task.cpus" -> taskCpus.toString)
 
     val numFreeCores = 3
     val workerOffers = IndexedSeq(

@@ -22,7 +22,6 @@ import org.scalatest.concurrent.{Signaler, ThreadSignaler, TimeLimits}
 import org.scalatest.time.{Millis, Span}
 
 import org.apache.spark.internal.config
-import org.apache.spark.internal.config.Tests._
 import org.apache.spark.security.EncryptionFunSuite
 import org.apache.spark.storage.{RDDBlockId, StorageLevel}
 import org.apache.spark.util.io.ChunkedByteBuffer
@@ -87,7 +86,7 @@ class DistributedSuite extends SparkFunSuite with Matchers with LocalSparkContex
   }
 
   test("groupByKey where map output sizes exceed maxMbInFlight") {
-    val conf = new SparkConf().set(config.REDUCER_MAX_SIZE_IN_FLIGHT.key, "1m")
+    val conf = new SparkConf().set("spark.reducer.maxSizeInFlight", "1m")
     sc = new SparkContext(clusterUrl, "test", conf)
     // This data should be around 20 MB, so even with 4 mappers and 2 reducers, each map output
     // file should be about 2.5 MB
@@ -196,7 +195,7 @@ class DistributedSuite extends SparkFunSuite with Matchers with LocalSparkContex
         new ChunkedByteBuffer(bytes.nioByteBuffer()).toInputStream())(data.elementClassTag).toList
       assert(deserialized === (1 to 100).toList)
     }
-    // This will exercise the getRemoteValues code path:
+    // This will exercise the getRemoteBytes / getRemoteValues code paths:
     assert(blockIds.flatMap(id => blockManager.get[Int](id).get.data).toSet === (1 to 1000).toSet)
   }
 
@@ -217,9 +216,8 @@ class DistributedSuite extends SparkFunSuite with Matchers with LocalSparkContex
   test("compute without caching when no partitions fit in memory") {
     val size = 10000
     val conf = new SparkConf()
-      .set(config.STORAGE_UNROLL_MEMORY_THRESHOLD, 1024L)
-      .set(TEST_MEMORY, size.toLong / 2)
-
+      .set("spark.storage.unrollMemoryThreshold", "1024")
+      .set("spark.testing.memory", (size / 2).toString)
     sc = new SparkContext(clusterUrl, "test", conf)
     val data = sc.parallelize(1 to size, 2).persist(StorageLevel.MEMORY_ONLY)
     assert(data.count() === size)
@@ -234,9 +232,8 @@ class DistributedSuite extends SparkFunSuite with Matchers with LocalSparkContex
     val size = 10000
     val numPartitions = 20
     val conf = new SparkConf()
-      .set(config.STORAGE_UNROLL_MEMORY_THRESHOLD, 1024L)
-      .set(TEST_MEMORY, size.toLong)
-
+      .set("spark.storage.unrollMemoryThreshold", "1024")
+      .set("spark.testing.memory", size.toString)
     sc = new SparkContext(clusterUrl, "test", conf)
     val data = sc.parallelize(1 to size, numPartitions).persist(StorageLevel.MEMORY_ONLY)
     assert(data.count() === size)
@@ -255,7 +252,7 @@ class DistributedSuite extends SparkFunSuite with Matchers with LocalSparkContex
   }
 
   test("recover from node failures") {
-    import DistributedSuite.{failOnMarkedIdentity, markNodeIfIdentity}
+    import DistributedSuite.{markNodeIfIdentity, failOnMarkedIdentity}
     DistributedSuite.amMaster = true
     sc = new SparkContext(clusterUrl, "test")
     val data = sc.parallelize(Seq(true, true), 2)
@@ -265,7 +262,7 @@ class DistributedSuite extends SparkFunSuite with Matchers with LocalSparkContex
   }
 
   test("recover from repeated node failures during shuffle-map") {
-    import DistributedSuite.{failOnMarkedIdentity, markNodeIfIdentity}
+    import DistributedSuite.{markNodeIfIdentity, failOnMarkedIdentity}
     DistributedSuite.amMaster = true
     sc = new SparkContext(clusterUrl, "test")
     for (i <- 1 to 3) {
@@ -277,7 +274,7 @@ class DistributedSuite extends SparkFunSuite with Matchers with LocalSparkContex
   }
 
   test("recover from repeated node failures during shuffle-reduce") {
-    import DistributedSuite.{failOnMarkedIdentity, markNodeIfIdentity}
+    import DistributedSuite.{markNodeIfIdentity, failOnMarkedIdentity}
     DistributedSuite.amMaster = true
     sc = new SparkContext(clusterUrl, "test")
     for (i <- 1 to 3) {
@@ -296,7 +293,7 @@ class DistributedSuite extends SparkFunSuite with Matchers with LocalSparkContex
   }
 
   test("recover from node failures with replication") {
-    import DistributedSuite.{failOnMarkedIdentity, markNodeIfIdentity}
+    import DistributedSuite.{markNodeIfIdentity, failOnMarkedIdentity}
     DistributedSuite.amMaster = true
     // Using more than two nodes so we don't have a symmetric communication pattern and might
     // cache a partially correct list of peers.

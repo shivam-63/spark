@@ -56,8 +56,6 @@ class StageInfo(
     completionTime = Some(System.currentTimeMillis)
   }
 
-  // This would just be the second constructor arg, except we need to maintain this method
-  // with parentheses for compatibility
   def attemptNumber(): Int = attemptId
 
   private[spark] def getStatusString: String = {

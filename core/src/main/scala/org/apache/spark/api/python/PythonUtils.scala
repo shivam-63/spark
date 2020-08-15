@@ -32,8 +32,7 @@ private[spark] object PythonUtils {
     val pythonPath = new ArrayBuffer[String]
     for (sparkHome <- sys.env.get("SPARK_HOME")) {
       pythonPath += Seq(sparkHome, "python", "lib", "pyspark.zip").mkString(File.separator)
-      pythonPath +=
-        Seq(sparkHome, "python", "lib", "py4j-0.10.8.1-src.zip").mkString(File.separator)
+      pythonPath += Seq(sparkHome, "python", "lib", "py4j-0.10.7-src.zip").mkString(File.separator)
     }
     pythonPath ++= SparkContext.jarOfObject(this)
     pythonPath.mkString(File.pathSeparator)
@@ -76,7 +75,7 @@ private[spark] object PythonUtils {
     jm.asScala.toMap
   }
 
-  def isEncryptionEnabled(sc: JavaSparkContext): Boolean = {
+  def getEncryptionEnabled(sc: JavaSparkContext): Boolean = {
     sc.conf.get(org.apache.spark.internal.config.IO_ENCRYPTION_ENABLED)
   }
 }
