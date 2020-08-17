@@ -176,7 +176,7 @@ private[spark] object UIUtils extends Logging {
     <link rel="stylesheet"
           href={prependBaseUri(request, "/static/timeline-view.css")} type="text/css"/>
     <script src={prependBaseUri(request, "/static/sorttable.js")} ></script>
-    <script src={prependBaseUri(request, "/static/jquery-1.12.4.min.js")}></script>
+    <script src={prependBaseUri(request, "/static/jquery-1.11.1.min.js")}></script>
     <script src={prependBaseUri(request, "/static/vis.min.js")}></script>
     <script src={prependBaseUri(request, "/static/bootstrap-tooltip.js")}></script>
     <script src={prependBaseUri(request, "/static/initialize-tooltips.js")}></script>
@@ -199,12 +199,14 @@ private[spark] object UIUtils extends Logging {
 
   def dataTablesHeaderNodes(request: HttpServletRequest): Seq[Node] = {
     <link rel="stylesheet" href={prependBaseUri(request,
-      "/static/jquery.dataTables.1.10.18.min.css")} type="text/css"/>
+      "/static/jquery.dataTables.1.10.4.min.css")} type="text/css"/>
     <link rel="stylesheet"
           href={prependBaseUri(request, "/static/dataTables.bootstrap.css")} type="text/css"/>
     <link rel="stylesheet"
           href={prependBaseUri(request, "/static/jsonFormatter.min.css")} type="text/css"/>
-    <script src={prependBaseUri(request, "/static/jquery.dataTables.1.10.18.min.js")}></script>
+    <link rel="stylesheet"
+          href={prependBaseUri(request, "/static/webui-dataTables.css")} type="text/css"/>
+    <script src={prependBaseUri(request, "/static/jquery.dataTables.1.10.4.min.js")}></script>
     <script src={prependBaseUri(request, "/static/jquery.cookies.2.2.0.min.js")}></script>
     <script src={prependBaseUri(request, "/static/jquery.blockUI.min.js")}></script>
     <script src={prependBaseUri(request, "/static/dataTables.bootstrap.min.js")}></script>
@@ -567,6 +569,7 @@ private[spark] object UIUtils extends Logging {
         NEWLINE_AND_SINGLE_QUOTE_REGEX.replaceAllIn(requestParameter, ""))
     }
   }
+
 
   def buildErrorResponse(status: Response.Status, msg: String): Response = {
     Response.status(status).entity(msg).`type`(MediaType.TEXT_PLAIN).build()

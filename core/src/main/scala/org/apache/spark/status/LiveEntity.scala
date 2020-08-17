@@ -26,7 +26,7 @@ import scala.collection.mutable.HashMap
 import com.google.common.collect.Interners
 
 import org.apache.spark.JobExecutionStatus
-import org.apache.spark.executor.TaskMetrics
+import org.apache.spark.executor.{ExecutorMetrics, TaskMetrics}
 import org.apache.spark.scheduler.{AccumulableInfo, StageInfo, TaskInfo}
 import org.apache.spark.status.api.v1
 import org.apache.spark.storage.RDDInfo
@@ -61,10 +61,11 @@ private[spark] abstract class LiveEntity {
 private class LiveJob(
     val jobId: Int,
     name: String,
-    submissionTime: Option[Date],
+    val submissionTime: Option[Date],
     val stageIds: Seq[Int],
     jobGroup: Option[String],
-    numTasks: Int) extends LiveEntity {
+    numTasks: Int,
+    sqlExecutionId: Option[Long]) extends LiveEntity {
 
   var activeTasks = 0
   var completedTasks = 0
@@ -108,7 +109,7 @@ private class LiveJob(
       skippedStages.size,
       failedStages,
       killedSummary)
-    new JobDataWrapper(info, skippedStages)
+    new JobDataWrapper(info, skippedStages, sqlExecutionId)
   }
 
 }
@@ -257,6 +258,7 @@ private class LiveExecutor(val executorId: String, _addTime: Long) extends LiveE
   var blacklistedInStages: Set[Int] = TreeSet()
 
   var executorLogs = Map[String, String]()
+  var attributes = Map[String, String]()
 
   // Memory metrics. They may not be recorded (e.g. old event logs) so if totalOnHeap is not
   // initialized, the store will not contain this information.
@@ -266,6 +268,9 @@ private class LiveExecutor(val executorId: String, _addTime: Long) extends LiveE
   var usedOffHeap = 0L
 
   def hasMemoryInfo: Boolean = totalOnHeap >= 0L
+
+  // peak values for executor level metrics
+  val peakExecutorMetrics = new ExecutorMetrics()
 
   def hostname: String = if (host != null) host else hostPort.split(":")(0)
 
@@ -301,10 +306,11 @@ private class LiveExecutor(val executorId: String, _addTime: Long) extends LiveE
       Option(removeReason),
       executorLogs,
       memoryMetrics,
-      blacklistedInStages)
+      blacklistedInStages,
+      Some(peakExecutorMetrics).filter(_.isSet),
+      attributes)
     new ExecutorSummaryWrapper(info)
   }
-
 }
 
 private class LiveExecutorStageSummary(
